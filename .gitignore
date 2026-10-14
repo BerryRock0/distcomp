@@ -1,0 +1,12 @@
+# артефакты сборки
+build/
+bin/
+
+# прогоны тестов и стенда
+.test/
+.demo/
+runs/
+
+# Python
+__pycache__/
+*.pyc

@@ -91,13 +91,10 @@ $(BUILD)/udp.o:     $(SRC)/udp.h   $(SRC)/util.h
 $(BUILD)/main.o:    $(SRC)/tty.h $(SRC)/conf.h $(SRC)/plan.h $(SRC)/llm.h $(SRC)/sched.h $(SRC)/util.h $(SRC)/web.h $(SRC)/shard.h
 $(BUILD)/web.o:     $(SRC)/web.h  $(SRC)/conf.h $(SRC)/plan.h $(SRC)/llm.h $(SRC)/sched.h $(SRC)/json.h $(SRC)/util.h
 $(BUILD)/ui.o:      $(SRC)/web.h
-$(BUILD)/shard.o:   $(SRC)/shard.h $(SRC)/conf.h $(SRC)/plan.h $(SRC)/sched.h $(SRC)/json.h $(SRC)/util.h
-$(BUILD)/daemon.o:  $(SRC)/conf.h $(SRC)/json.h $(SRC)/expr.h $(SRC)/udp.h $(SRC)/util.h \
-                    $(SRC)/engine.h $(SRC)/gguf.h
 $(BUILD)/shard.o:   $(SRC)/shard.h $(SRC)/conf.h $(SRC)/plan.h $(SRC)/sched.h $(SRC)/json.h \
                     $(SRC)/util.h $(SRC)/engine.h $(SRC)/gguf.h
-$(BUILD)/web.o:     $(SRC)/web.h $(SRC)/conf.h $(SRC)/plan.h $(SRC)/llm.h $(SRC)/sched.h \
-                    $(SRC)/json.h $(SRC)/util.h
+$(BUILD)/daemon.o:  $(SRC)/conf.h $(SRC)/json.h $(SRC)/expr.h $(SRC)/udp.h $(SRC)/util.h \
+                    $(SRC)/engine.h $(SRC)/gguf.h
 $(BUILD)/daemon_lite.o $(BUILD)/engine_lite.o $(BUILD)/gguf_lite.o $(BUILD)/tok_lite.o: \
                       $(SRC)/engine.h $(SRC)/gguf.h $(SRC)/tok.h
 
@@ -113,23 +110,3 @@ test: all
 
 clean:
 	rm -rf $(BUILD) $(BIN)
-
-### ЗАВИСИМОСТИ ПОСТРОЕНИЯ ###
-
-$(BUILD)/%.o: $(SRC)/%.c | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-.PHONY := all config run-example test clean lite size
-
-### ДОСТУПНЫЕ ЦЕЛИ ПОСТРОЕНИЯ ###
-
-# Стандартная сборка с предупреждениями (уровень 2)
-all: | $(BUILD) $(BIN)
-	$(CC) $(CFLAGS) -Werror=implicit-function-declaration,implicit-int,return-type-c-mismatch \
-\t-Wpadded,-cast-qual,-missing-prototypes,-strict-prototypes ...
-
-lite: | $(BUILD) $(BIN)
-	$(CC) $(CFLAGS) $(LITEFLAGS) -DSTATIC -DCORE_ONLY $(LINKSRC) -Wl,-N,-Bsymbolic,--gc-sections -o $(BIN)/core
-
-size:
-	$(CC) $(CFLAGS) -Os -Wl,--gc-sections $(LDFLAGS) -o $(BIN)/core $(LINKSRC)
