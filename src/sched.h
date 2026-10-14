@@ -1,0 +1,42 @@
+#ifndef DC_SCHED_H
+#define DC_SCHED_H
+
+#include "conf.h"
+#include "plan.h"
+
+/* Состояние одного узла после PING/PONG — для CLI и веб-интерфейса. */
+typedef struct {
+    char role[32];
+    char url[160];
+    char host[320];
+    int  alive;
+    int  ms;
+    int  max_body;     /* сколько байт задачи узел примет; 0 = неизвестно */
+    long free_mem;     /* сколько байт под веса модели узел отдаёт */
+    char shard[96];    /* что узел уже держит из модели */
+    char arch[48];     /* платформа узла: x86_64, arm, lite… */
+    char detail[256];
+} dc_node_status;
+
+/* Выполняет план: шаги с готовыми зависимостями запускаются параллельно,
+ * внутри роли выбирается наименее загруженный узел.
+ * Печатает ход выполнения в stdout. Возвращает 0, если все шаги успешны. */
+int sched_run(plan *p, dc_config *cfg);
+
+/* Пингует все узлы конфигурации и заодно запоминает их возможности
+ * (max_body, роли) в dc_endpoint.cap. Возвращает число заполненных записей. */
+int sched_probe(dc_config *cfg, dc_node_status *out, int max);
+
+/* То же, но без печати и без отчёта: просто узнать, что умеет каждый узел.
+ * Дёшево повторно не опрашивает уже опрошенные узлы — результат лежит в cap.
+ * Вызывается перед обращением к LLM, чтобы в промпте стояли настоящие
+ * лимиты тела, а не догадки. */
+int sched_learn_caps(dc_config *cfg);
+
+/* Проверка доступности всех узлов с печатью в stdout. */
+int sched_check(dc_config *cfg);
+
+/* Печать плана: шаг -> роль -> узел(ы). */
+void sched_print_plan(const plan *p, const dc_config *cfg);
+
+#endif /* DC_SCHED_H */

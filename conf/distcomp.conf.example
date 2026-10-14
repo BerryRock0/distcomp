@@ -1,0 +1,30 @@
+# distcomp — конфигурация планировщика распределённых вычислений
+# Пользователь сам решает, какой узел какую роль обслуживает.
+
+[llm]
+# любой OpenAI-совместимый endpoint
+url          = https://api.openai.com/v1/chat/completions
+model        = gpt-4o-mini
+api_key      = $OPENAI_API_KEY     # можно $ПЕРЕМЕННАЯ или пусто
+style        = openai              # openai | anthropic
+json_mode    = auto                # auto | on | off (принудительный JSON-режим)
+timeout_ms   = 120000
+temperature  = 0
+payload_mode = expr                # expr — payload это арифметика; free — произвольный текст
+
+[role compute]
+daemon = 127.0.0.1:9101       # вычисления (host:port, транспорт UDP)
+daemon = 127.0.0.1:9102       # второй вычислитель (балансировка)
+
+[role verify]
+daemon = 127.0.0.1:9103       # проверка
+
+[role memorize]
+daemon = 127.0.0.1:9104       # запоминание
+
+[scheduler]
+concurrency = 4
+retries     = 2
+timeout_ms  = 60000
+backoff_ms  = 500
+outdir      = runs

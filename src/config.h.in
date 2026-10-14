@@ -1,0 +1,12 @@
+/* DC_CONFIG_H - auto-generated configuration */
+/* DO NOT EDIT MANUALLY - use ./scripts/genconfig.sh instead */
+/* -----------------------------------------------------------------------------*/
+/*
+ * Auto-generated configuration values.
+ */
+#ifndef DC_CONFIG_H
+#define DC_CONFIG_H
+
+@CONFIG_C@
+
+#endif /* DC_CONFIG_H */
