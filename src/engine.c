@@ -92,10 +92,17 @@ static int read_shape(const gguf_file *g, const char *arch, llm_ctx *c, char *er
     unsigned long rd = 0;
     if (gguf_u32(g, &rd, "rope.dimension_count", arch) == 0 && rd > 0) c->head_dim = (int)rd;
 
+    /* n_vocab нужен только стадиям входа/выхода; узел со слоями держит не весь
+     * тензор эмбеддингов, поэтому размер словаря может прийти метаданными. */
     const gguf_tensor *emb = gguf_tensor_find(g, "token_embd.weight");
-    if (!emb) ERR("в модели нет token_embd.weight");
-    if (emb->n_dims != 2) ERR("token_embd.weight: ожидалось 2 измерения");
-    c->n_vocab = (int)emb->dims[1];
+    if (emb) {
+        if (emb->n_dims != 2) ERR("token_embd.weight: ожидалось 2 измерения");
+        c->n_vocab = (int)emb->dims[1];
+    } else if (gguf_u32(g, &v, "vocab_size", arch) == 0) {
+        c->n_vocab = (int)v;
+    } else {
+        c->n_vocab = 0;
+    }
     if (c->n_ctx <= 0) c->n_ctx = 512;
     return 0;
 }
@@ -149,6 +156,9 @@ int llm_ctx_open(llm_ctx *c, const gguf_file *g, int stage, int first, int last,
     c->stage = stage;
     c->first = first;
     c->last = last;
+
+    if ((stage == LLM_STAGE_EMBED || stage == LLM_STAGE_HEAD) && c->n_vocab <= 0)
+        ERR("не удалось определить размер словаря (n_vocab) для стадии %d", stage);
 
     if (stage == LLM_STAGE_EMBED) {
         c->w_emb.t = gguf_tensor_find(g, "token_embd.weight");

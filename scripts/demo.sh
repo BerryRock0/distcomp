@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-# Стенд: обычный узел и lite-узел на одной машине (UDP), план без LLM.
+# Стенд на одной машине (UDP): сначала планировщик без LLM, затем настоящая
+# модель llama (GGUF), разложенная по устройствам-узлам роли `shard`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 RUN=.demo
 rm -rf "$RUN"; mkdir -p "$RUN/state"
 
-# обычный узел: считает всё, две роли
+# --- планировщик: обычный узел и lite-узел (для маленьких устройств) ------
 ./bin/dcd --role compute --role verify --port 9101 --tag server-a \
          --state "$RUN/state" >"$RUN/server-a.log" 2>&1 &
 A=$!
-# lite-узел: сборка для маленьких устройств, лимит тела 1024 байта.
-# он же держит часть весов модели — на 8 КБ пула два-три слоя поместятся
-./bin/dcd-lite --role compute --role memorize --role shard --port 9102 --tag mcu-01 \
+# lite-сборка: лимит тела 1024 байта, пул модели 8 КБ — как у микроконтроллера
+./bin/dcd-lite --role compute --role memorize --port 9102 --tag mcu-01 \
          --free-mem 1200 --state "$RUN/state" >"$RUN/mcu-01.log" 2>&1 &
 B=$!
-# второй держатель весов, помощнее
-./bin/dcd --role shard --port 9103 --tag board-1 --free-mem 2500 \
-         --state "$RUN/state" >"$RUN/board-1.log" 2>&1 &
-C=$!
-trap 'kill $A $B $C 2>/dev/null || true' EXIT
+
+# --- устройства, между которыми раскладываем модель ----------------------
+# Конвейеру нужны минимум три узла: вход, слои и выход живут на разных
+# устройствах (узел держит ровно один контекст движка). Возьмём пять и дадим
+# большим узлам больше памяти — им достанется больше слоёв.
+./bin/dcd --role shard --port 9111 --tag in  --free-mem 450000 --state "$RUN/state" >"$RUN/sh-in.log"  2>&1 &
+S1=$!
+./bin/dcd --role shard --port 9112 --tag big --free-mem 450000 --state "$RUN/state" >"$RUN/sh-big.log" 2>&1 &
+S2=$!
+./bin/dcd --role shard --port 9113 --tag sm1 --free-mem 250000 --state "$RUN/state" >"$RUN/sh-sm1.log" 2>&1 &
+S3=$!
+./bin/dcd --role shard --port 9114 --tag sm2 --free-mem 250000 --state "$RUN/state" >"$RUN/sh-sm2.log" 2>&1 &
+S4=$!
+./bin/dcd --role shard --port 9115 --tag out --free-mem 450000 --state "$RUN/state" >"$RUN/sh-out.log" 2>&1 &
+S5=$!
+trap 'kill $A $B $S1 $S2 $S3 $S4 $S5 2>/dev/null || true' EXIT
 sleep 1
 
 cat > "$RUN/distcomp.conf" <<EOF
@@ -45,16 +56,18 @@ timeout_ms  = 5000
 outdir      = $RUN/runs
 EOF
 
-# устройства, между которыми раскладывается модель: у lite-узла памяти мало,
-# поэтому часть слоёв достанется серверу
+# устройства для раскладки модели (роль shard)
 cat > "$RUN/shard.conf" <<EOF
 [llm]
 api_key =
 [role shard]
-daemon = 127.0.0.1:9102     # у микроконтроллера памяти мало
-daemon = 127.0.0.1:9103
+daemon = 127.0.0.1:9111
+daemon = 127.0.0.1:9112
+daemon = 127.0.0.1:9113
+daemon = 127.0.0.1:9114
+daemon = 127.0.0.1:9115
 [scheduler]
-timeout_ms = 5000
+timeout_ms = 8000
 retries   = 0
 outdir    = $RUN/runs
 EOF
@@ -101,17 +114,22 @@ EOF
 ./bin/dcctl -c "$RUN/only-lite.conf" --no-llm -f "$RUN/over.json" run || true
 
 echo
-echo "=== модель, разложенная по памяти устройств ==="
-# тот же lite-узел, но теперь как держатель части модели: у него 8 КБ пула
-./bin/dcctl -c "$RUN/shard.conf" shard gen "$RUN/model.bin" 6 8
-./bin/dcctl -c "$RUN/shard.conf" shard info "$RUN/model.bin"
-./bin/dcctl -c "$RUN/shard.conf" shard deploy "$RUN/model.bin" | tail -4
+echo "=== модель llama (GGUF), разложенная по памяти устройств ==="
+# эталонная мини-модель со всеми деталями настоящей: RMSNorm, RoPE,
+# grouped-query attention, SwiGLU, KV-кэш, BPE-токенизатор
+python3 scripts/llama_ref.py "$RUN/model.gguf" --json "$RUN/ref.json"
 echo
-./bin/dcctl -c "$RUN/shard.conf" shard run "$RUN/model.bin" 0.5 -0.25 1 0.75 -1 0.3 0.2 -0.8 | tail -8
+./bin/dcctl -c "$RUN/shard.conf" llm info "$RUN/model.gguf"
+./bin/dcctl -c "$RUN/shard.conf" llm deploy "$RUN/model.gguf" | tail -6
+echo
+./bin/dcctl -c "$RUN/shard.conf" llm prompt "$RUN/model.gguf" "distcomp" 8 | tail -6
+echo
+echo "=== независимый эталон на numpy: те же жадные токены ==="
+python3 scripts/gguf_expected.py --prompt distcomp --tokens 8
 
 echo
 echo "=== журналы узлов ==="
-for f in server-a mcu-01 board-1; do
+for f in server-a mcu-01; do
   echo "--- $f"
   grep -E '^\[' "$RUN/$f.log" | tail -6 || true
 done

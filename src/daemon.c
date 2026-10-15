@@ -740,15 +740,26 @@ static int shard_put(const req_t *r, char *out, size_t outsz, char *detail, size
     if (*p != '|' || len == 0) return -1;
     p++;
 
+    /* сначала число измерений, затем сами размеры: «ndim|d0,d1,..» */
     unsigned long dims[4];
-    unsigned ndim = 0;
-    while (*p && *p != '|' && ndim < 4) {
+    unsigned      ndim = 0;
+    {
+        const char *e = NULL;
+        unsigned long v = strtoul(p, (char **)&e, 10);
+        if (e == p || *e != '|' || v == 0 || v > 4) return -1;
+        ndim = (unsigned)v;
+        p = e + 1;
+    }
+    for (unsigned i = 0; i < ndim; i++) {
         const char *e = NULL;
         unsigned long v = strtoul(p, (char **)&e, 10);
         if (e == p) return -1;
-        dims[ndim++] = v;
+        dims[i] = v;
         p = e;
-        if (*p == ',') p++;
+        if (i + 1 < ndim) {
+            if (*p != ',') return -1;
+            p++;
+        }
     }
     if (*p != '|') return -1;
     p++;
@@ -838,12 +849,13 @@ static int shard_shape(const req_t *r, char *out, size_t outsz, char *detail, si
     if (strncmp(p, "shape|", 6) != 0) return -1;
     p += 6;
     char *f[15];
-    for (int i = 0; i < 15; i++) {
-        f[i] = p;
+    int   nf = 0;
+    while (nf < 15 && *p) {
+        f[nf++] = p;
         while (*p && *p != '|') p++;
         if (*p == '|') { *p = '\0'; p++; }
-        else if (i < 14) return -1;
     }
+    if (nf < 13) return -1;   /* stage|first|last|embd|head|head_kv|ff|hdim|vocab|nlayer|eps|rope|n_ctx */
     int stage = atoi(f[0]), first = atoi(f[1]), last = atoi(f[2]);
     int n_embd = atoi(f[3]), n_head = atoi(f[4]), n_head_kv = atoi(f[5]);
     int n_ff = atoi(f[6]), head_dim = atoi(f[7]), n_vocab = atoi(f[8]);
@@ -906,6 +918,7 @@ static int shard_shape(const req_t *r, char *out, size_t outsz, char *detail, si
     META_F32("llama.rope.freq_base", (float)rope);
     META_U32("llama.rope.dimension_count", (unsigned long)head_dim);
     META_U32("llama.context_length", (unsigned long)n_ctx);
+    META_U32("llama.vocab_size", (unsigned long)n_vocab);
     shard_g.n_meta = (size_t)shard_gm_n;
 #undef META_STR
 #undef META_U32
@@ -960,6 +973,25 @@ static int shard_gen(const req_t *r, char *out, size_t outsz, char *detail, size
     int tok = (int)strtol(p, (char **)&e, 10);
     if (e == p) return -1;
 
+    /* состояние от предыдущей стадии: gen|токен|base64. У входа его нет,
+     * у слоёв и выхода — есть: движок читает вход прямо из shard_res. */
+    if (*e == '|' && e[1]) {
+        size_t need = (size_t)shard_ctx.n_embd * sizeof(float);
+        if (need > sizeof shard_res) {
+            scpy(out, outsz, "ОШИБКА");
+            scpy(detail, detailsz, "состояние не влезает в буфер узла");
+            *ok = 0;
+            return 0;
+        }
+        size_t dec = 0;
+        if (b64_decode(e + 1, shard_res, need, &dec) != 0 || dec != need) {
+            scpy(out, outsz, "ОШИБКА");
+            scpy(detail, detailsz, "не разобрано состояние от предыдущей стадии");
+            *ok = 0;
+            return 0;
+        }
+    }
+
     if (llm_forward(&shard_ctx, tok, shard_res) != 0) {
         scpy(out, outsz, "ОШИБКА");
         scpy(detail, detailsz, "шаг не выполнен: контекст исчерпан или токен вне словаря");
@@ -993,14 +1025,14 @@ static int shard_part(const req_t *r, char *out, size_t outsz, int *ok)
     p = e + 1;
     long n = strtol(p, (char **)&e, 10);
     if (e == p || i < 0 || n <= 0 || n > (long)sizeof shard_pool) return -1;
-    size_t off = (size_t)i * (size_t)n;
+    size_t off = (size_t)i;                 /* i — байтовое смещение в состоянии */
     if (off + (size_t)n > (size_t)shard_res_n * sizeof(float)) {
         scpy(out, outsz, "ОШИБКА");
         *ok = 0;
         return 0;
     }
     char b64[b64_encode_size((size_t)n)];
-    int  len = b64_encode(shard_res + off, (size_t)n, b64, sizeof b64);
+    int  len = b64_encode((const unsigned char *)shard_res + off, (size_t)n, b64, sizeof b64);
     if (len < 0) return -1;
     scpy(out, outsz, b64);
     *ok = 1;

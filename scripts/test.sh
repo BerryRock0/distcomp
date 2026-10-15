@@ -17,9 +17,9 @@
 #  15. негодный план от LLM: клиент объясняет причину и даёт модели починить
 #  16. обнаружение узлов активным запросом, а не ожиданием объявления по таймеру
 #  17. локальная LLM без ключа: llama.cpp/Ollama/LM Studio
-#  18. модель разложена по свободной памяти устройств
-#  19. разложенная по устройствам модель считает так же, как целиком,
-#      в том числе модель с меняющейся шириной слоёв
+#  18. модель llama (GGUF) разложена по свободной памяти устройств
+#  19. разложенная по устройствам модель считает так же, как целиком
+#      (сверка с локальным прогоном и независимым эталоном на numpy)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -510,63 +510,77 @@ else
 fi
 
 echo
-echo "18. модель разложена по памяти устройств"
-SH1=$((BASE+70)); SH2=$((BASE+71))
-"$DCD"            --role shard --port $SH1 --tag board-1 --free-mem 800 \
-                  --state "$T/state" >"$T/sh1.log" 2>&1 & PIDS="$PIDS $!"
-./bin/dcd-lite     --role shard --port $SH2 --tag mcu-01 --free-mem 2500 \
-                  --state "$T/state" >"$T/sh2.log" 2>&1 & PIDS="$PIDS $!"
-sleep 0.7
+echo "18. модель разложена по памяти устройств (GGUF/llama)"
+SH1=$((BASE+70)); SH2=$((BASE+71)); SH3=$((BASE+72)); SH4=$((BASE+73)); SH5=$((BASE+74))
+"$DCD" --role shard --port $SH1 --tag in  --free-mem 450000 --state "$T/state" >"$T/sh1.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --role shard --port $SH2 --tag big --free-mem 450000 --state "$T/state" >"$T/sh2.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --role shard --port $SH3 --tag sm1 --free-mem 250000 --state "$T/state" >"$T/sh3.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --role shard --port $SH4 --tag sm2 --free-mem 250000 --state "$T/state" >"$T/sh4.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --role shard --port $SH5 --tag out --free-mem 450000 --state "$T/state" >"$T/sh5.log" 2>&1 & PIDS="$PIDS $!"
+sleep 0.8
 cat > "$T/shard.conf" <<EOF
 [llm]
 api_key =
 [role shard]
 daemon = 127.0.0.1:$SH1
 daemon = 127.0.0.1:$SH2
+daemon = 127.0.0.1:$SH3
+daemon = 127.0.0.1:$SH4
+daemon = 127.0.0.1:$SH5
 [scheduler]
-timeout_ms = 5000
+timeout_ms = 8000
 retries = 0
 EOF
-check "узел сообщает память под модель" "$($DC -c "$T/shard.conf" check 2>&1)" "под модель 800 байт"
-$DC -c "$T/shard.conf" shard gen "$T/model.bin" 6 8 >/dev/null
-OUT=$($DC -c "$T/shard.conf" shard info "$T/model.bin" 2>&1)
+
+# эталонная мини-модель llama в формате GGUF (RMSNorm, RoPE, GQA, SwiGLU, BPE)
+if command -v python3 >/dev/null 2>&1; then
+  python3 scripts/llama_ref.py "$T/model.gguf" --json "$T/ref.json" >"$T/gguf.txt" 2>&1
+  ok "эталонная модель GGUF собрана ($(head -1 "$T/gguf.txt"))"
+else
+  bad "эталонная модель GGUF собрана" "нет python3"
+fi
+
+OUT=$($DC -c "$T/shard.conf" llm info "$T/model.gguf" 2>&1)
 check "раскладка показана"              "$OUT" "Раскладка модели по устройствам"
-check "модель разобрана на слои"       "$OUT" "слоёв 6"
-# маленькому узлу досталось меньше слоёв, чем большому
-SMALL1=$(printf '%s' "$OUT" | grep -c ":$SH1 " || true)
-SMALL2=$(printf '%s' "$OUT" | grep -c ":$SH2 " || true)
-if [ "$SMALL1" -gt 0 ] && [ "$SMALL2" -gt 0 ]; then
-  ok "оба узла держат часть модели ($SH1=$SMALL1, $SH2=$SMALL2)"
+check "модель разобрана на слои"        "$OUT" "слоёв 4"
+check "вход на отдельном узле"          "$OUT" "вход (эмбеддинг)"
+check "выход на отдельном узле"         "$OUT" "выход (голова)"
+# узлу с большей памятью досталось два слоя, узлам с меньшей — по одному
+BIG=$(printf '%s' "$OUT" | grep -c "слои 0..1")
+SM1=$(printf '%s' "$OUT" | grep -c "слой 2")
+SM2=$(printf '%s' "$OUT" | grep -c "слой 3")
+if [ "$BIG" -gt 0 ] && [ "$SM1" -gt 0 ] && [ "$SM2" -gt 0 ]; then
+  ok "по памяти: большому узлу 2 слоя, маленьким по 1"
 else
-  bad "оба узла держат часть модели" "$SH1=$SMALL1 $SH2=$SMALL2"
+  bad "по памяти: большому узлу 2 слоя, маленьким по 1" "big=$BIG sm1=$SM1 sm2=$SM2"
 fi
-# и ни один слой не превышает память, о которой узел объявил
-if python3 scripts/check_layers.py "$T/model.bin" 800,2500 >"$T/layers.txt" 2>&1; then
-  ok "слои влезают в объявленную память ($(cat "$T/layers.txt"))"
-else
-  bad "слои влезают в объявленную память" "$(cat "$T/layers.txt")"
-fi
-OUT=$($DC -c "$T/shard.conf" shard deploy "$T/model.bin" 2>&1)
-check "веса залиты на оба узла"         "$OUT" "Веса разложены"
+# конвейеру нужно минимум три узла: вход, слои и выход — на разных устройствах
+cat > "$T/two.conf" <<EOF
+[llm]
+api_key =
+[role shard]
+daemon = 127.0.0.1:$SH1
+daemon = 127.0.0.1:$SH5
+[scheduler]
+timeout_ms = 8000
+retries = 0
+EOF
+OUT=$($DC -c "$T/two.conf" llm info "$T/model.gguf" 2>&1)
+check "двух узлов мало для конвейера"   "$OUT" "нужно минимум 3 узла"
+OUT=$($DC -c "$T/shard.conf" llm deploy "$T/model.gguf" 2>&1)
+check "веса залиты на все узлы"         "$OUT" "Веса разложены"
 check_absent "загрузка без ошибок"      "$OUT" "ОШИБКА"
 
 echo
 echo "19. модель на нескольких устройствах считает так же, как целиком"
-OUT=$($DC -c "$T/shard.conf" shard run "$T/model.bin" 0.5 -0.25 1 0.75 -1 0.3 0.2 -0.8 2>&1); RC=$?
-check "конвейер отработал"             "$OUT" "Ответ распределённо"
-check "ответ есть и в своём счёте"     "$OUT" "Ответ целиком у себя"
-check "расхождение нулевое"            "$OUT" "расхождение 0"
-check "код возврата 0"                 "$RC"  "0"
-
-# модель с меняющейся шириной: буферные ошибки сразу дают расхождение
+OUT=$($DC -c "$T/shard.conf" llm prompt "$T/model.gguf" "distcomp" 4 2>&1); RC=$?
+check "конвейер отработал"              "$OUT" "Генерация (жадная)"
+check "сверка с локальным прогоном"     "$OUT" "все 4 сгенерированных токенов совпали"
+check "код возврата 0"                  "$RC"  "0"
+# независимый эталон на numpy: те же жадные токены, что выдал распределённый конвейер
 if command -v python3 >/dev/null 2>&1; then
-  python3 scripts/make_varwidth_model.py "$T/varw.bin" >/dev/null
-  $DC -c "$T/shard.conf" shard deploy "$T/varw.bin" >/dev/null 2>&1
-  OUT=$($DC -c "$T/shard.conf" shard run "$T/varw.bin" 1 -0.5 0.25 2 2>&1); RC=$?
-  check "растущая ширина: конвейер отработал" "$OUT" "Ответ распределённо"
-  check "растущая ширина: ответ на месте"    "$OUT" "Ответ целиком у себя"
-  check "растущая ширина: расхождение 0"     "$OUT" "расхождение 0"
-  check "растущая ширина: код возврата 0"    "$RC"  "0"
+  EXP=$(python3 scripts/gguf_expected.py --prompt distcomp --tokens 4 2>/dev/null)
+  check "токены совпали с эталоном numpy" "$OUT" "$EXP"
 fi
 
 echo
