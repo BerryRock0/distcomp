@@ -6,6 +6,7 @@
 #include "tok.h"
 #include "udp.h"
 #include "util.h"
+#include "xport.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -35,6 +36,23 @@
 
 /* ---------------------------------------------------------------- модель --- */
 
+/* Сколько токенов контекста готовим по умолчанию и сколько в принципе можно.
+ * KV-кэш растёт линейно по контексту, поэтому это в первую очередь вопрос
+ * памяти устройств, а не «хочется ли нам длинного ответа». */
+#define DC_CTX_DEFAULT 512
+#define DC_CTX_MAX     4096
+
+/* Сколько токенов промпта мы в состоянии закодировать (потолок для буфера). */
+#define DC_PROMPT_TOKENS 8192
+
+/* Сколько байт модели читать ради словаря. Заголовок со словарём в сотни
+ * тысяч слов занимает единицы мегабайт; веса после него не нужны. */
+#define DC_TOKENIZER_READ_MAX (32 * 1024 * 1024)
+
+/* Таймаут одного обмена с узлом конвейера. Кусок тензора не больше max_body,
+ * поэтому этого хватает и на медленной плате. */
+#define DC_PIPE_TIMEOUT_MS 20000
+
 typedef struct {
     unsigned char *raw;
     size_t         size;
@@ -56,7 +74,8 @@ static void llm_free(llm_model *m)
     memset(m, 0, sizeof *m);
 }
 
-static int llm_open_file(llm_model *m, const char *path, char *err, size_t errlen)
+static int llm_open_file(llm_model *m, const char *path, int n_ctx_want,
+                         char *err, size_t errlen)
 {
     memset(m, 0, sizeof *m);
     FILE *f = fopen(path, "rb");
@@ -110,8 +129,14 @@ static int llm_open_file(llm_model *m, const char *path, char *err, size_t errle
     const gguf_tensor *emb = gguf_tensor_find(&m->g, "token_embd.weight");
     if (emb && emb->n_dims == 2) m->n_vocab = (int)emb->dims[1];
 
-    /* контекст узла: меньше просит — меньше памяти под KV-кэш */
-    if (m->n_ctx <= 0 || m->n_ctx > 512) m->n_ctx = 512;
+    /* Сколько токенов контекста мы собираемся прогнать. Это не берётся из
+     * модели: у Qwen2.5 в метаданных 32768, а плата столько не удержит —
+     * контекст это KV-кэш, и он памятен. Поэтому задаётся явно, а сверху
+     * ограничен DC_CTX_MAX, иначе одна опечатка в конфигурации уронит парк
+     * устройств попыткой выделить кубом гигабайт. */
+    if (n_ctx_want > DC_CTX_MAX) n_ctx_want = DC_CTX_MAX;
+    if (n_ctx_want > 0) m->n_ctx = n_ctx_want;
+    if (m->n_ctx <= 0 || m->n_ctx > DC_CTX_MAX) m->n_ctx = DC_CTX_DEFAULT;
 
     if (llm_tok_open(&m->tok, &m->g, e, sizeof e) != 0) {
         snprintf(err, errlen, "токенизатор: %s", e);
@@ -403,26 +428,20 @@ static int local_forward(local_run *L, int token)
 
 /* Стадии по порядку: вход, слои, выход. Каждая — на своём узле. */
 typedef struct {
-    int sock;
     const llm_model *m;
-    const llm_node *nodes;
-    const int *owner;
-    int nstages;
-    float *state;      /* текущее состояние, n_embd */
-    int    n_embd;
+    const llm_node  *nodes;
+    const int       *owner;
+    int              nstages;
+    float           *state;      /* текущее состояние, n_embd */
+    int              n_embd;
 } pipeline;
 
-/* Отправляет payload узлу, разбирает JSON-ответ и отдаёт поле output.
- * Ошибка транспорта, неразобранный JSON или ok=false — это -1 с текстом в err. */
-static int pipe_send(int sock, const dc_endpoint *ep, const char *payload, char **out_body,
+/* Отправляет команду узлу: оборачивает её в конверт узла (role=shard,
+ * payload=команда), разбирает ответ и отдаёт поле output.
+ * Транспорт выбирается по схеме адреса: udp://, tcp://, dtn://. */
+static int pipe_send(dc_endpoint *ep, const char *payload, char **out_body,
                      char *err, size_t errlen)
 {
-    char host[128];
-    int  port;
-    if (udp_parse_endpoint(ep->url, host, sizeof host, &port, err, errlen) != 0) return -1;
-
-    /* Узел принимает только JSON-запрос с полем role; команда конвейера едет
-     * в поле payload. Собираем конверт и экранируем payload как строку. */
     strbuf b;
     sb_init(&b);
     sb_add(&b, "{\"role\":\"");
@@ -432,7 +451,7 @@ static int pipe_send(int sock, const dc_endpoint *ep, const char *payload, char 
     sb_add(&b, "}");
 
     char *resp = NULL;
-    int   rc   = udp_request_raw(sock, host, port, b.p, strlen(b.p), 5000, &resp, err, errlen);
+    int   rc   = xport_request_raw(ep, b.p, strlen(b.p), DC_PIPE_TIMEOUT_MS, &resp, err, errlen);
     sb_free(&b);
     if (rc != 0) return -1;
 
@@ -471,7 +490,7 @@ static int pipe_deploy_stage(pipeline *P, int s)
 
     /* сначала освобождаем узел: вторая модель не влезет поверх первой */
     char *out = NULL;
-    if (pipe_send(P->sock, nd->ep, "free", &out, err, sizeof err) != 0) {
+    if (pipe_send(nd->ep, "free", &out, err, sizeof err) != 0) {
         fprintf(stderr, "узел %s не освободился: %s\n", nd->ep->url, err);
         return -1;
     }
@@ -498,7 +517,7 @@ static int pipe_deploy_stage(pipeline *P, int s)
             free(b64);
 
             out = NULL;
-            if (pipe_send(P->sock, nd->ep, b.p, &out, err, sizeof err) != 0) {
+            if (pipe_send(nd->ep, b.p, &out, err, sizeof err) != 0) {
                 fprintf(stderr, "тензор %s не ушёл на %s: %s\n", st[i].name, nd->ep->url, err);
                 sb_free(&b);
                 return -1;
@@ -517,7 +536,7 @@ static int pipe_deploy_stage(pipeline *P, int s)
               m->head_dim, m->n_vocab, m->n_layer, (double)m->rms_eps, (double)m->rope_base,
               m->n_ctx);
     out = NULL;
-    if (pipe_send(P->sock, nd->ep, b.p, &out, err, sizeof err) != 0) {
+    if (pipe_send(nd->ep, b.p, &out, err, sizeof err) != 0) {
         fprintf(stderr, "shape не ушёл на %s: %s\n", nd->ep->url, err);
         sb_free(&b);
         return -1;
@@ -552,7 +571,7 @@ static int pipe_step(pipeline *P, int token, char *err, size_t errlen)
             free(b64);
         }
         char *out = NULL;
-        if (pipe_send(P->sock, nd->ep, b.p, &out, err, errlen) != 0) {
+        if (pipe_send(nd->ep, b.p, &out, err, errlen) != 0) {
             sb_free(&b);
             return -1;
         }
@@ -576,7 +595,7 @@ static int pipe_step(pipeline *P, int token, char *err, size_t errlen)
             sb_init(&b);
             sb_printf(&b, "part|%ld|%ld", got, n);
             out = NULL;
-            if (pipe_send(P->sock, nd->ep, b.p, &out, err, errlen) != 0) {
+            if (pipe_send(nd->ep, b.p, &out, err, errlen) != 0) {
                 sb_free(&b);
                 return -1;
             }
@@ -595,6 +614,299 @@ static int pipe_step(pipeline *P, int token, char *err, size_t errlen)
     return -1;
 }
 
+/* ------------------------------------------------------ распределённый LLM --- */
+/*
+ * То, ради чего всё затевалось: модель лежит не здесь. Планировщик держит
+ * только текст промпта и одно состояние размера n_embd, а веса — на узлах.
+ * Поэтому планировать цели можно с машины, на которой для модели памяти нет
+ * вовсе: узлов столько, сколько нужно, и каждый получает ровно свою часть.
+ */
+
+struct dc_infer {
+    llm_model m;
+    char      path[512];
+
+    llm_node nodes[DC_MAX_EPS];
+    int      owner[DC_MAX_EPS];
+    int      nn;          /* узлов роли shard */
+    int      nstages;     /* стадий в конвейере */
+
+    float *state;         /* активация между стадиями, n_embd */
+    int    used;          /* токенов контекста в последней генерации */
+    int    verbose;
+};
+
+static void infer_release(dc_infer *in)
+{
+    if (!in) return;
+    llm_free(&in->m);
+    free(in->state);
+    free(in);
+}
+
+void dc_infer_free(dc_infer *in)
+{
+    infer_release(in);
+}
+
+/* Раскладывает модель по узлам, но ничего не заливает: нужно для проверки
+ * «поместится ли вообще», когда веса трогать не хочется. */
+static int infer_plan(dc_config *cfg, const char *model_path, const dc_infer_opts *o,
+                      dc_infer **out, char *err, size_t errlen)
+{
+    *out = NULL;
+    int n_ctx   = o ? o->n_ctx : 0;
+    int verbose = o ? o->verbose : 0;
+
+    /* раскладка вслепую бессмысленна: сколько памяти отдаёт узел и какой у него
+     * лимит тела, известно только из ответа на PING */
+    if (sched_learn_caps(cfg) == 0) {
+        snprintf(err, errlen,
+                 "не удалось опросить узлы роли %s: они не отвечают или не сообщили "
+                 "свободную память (free_mem)",
+                 ROLE_SHARD);
+        return -1;
+    }
+
+    dc_infer *in = xcalloc(1, sizeof *in);
+    if (llm_open_file(&in->m, model_path, n_ctx, err, errlen) != 0) {
+        free(in);
+        return -1;
+    }
+    snprintf(in->path, sizeof in->path, "%s", model_path);
+    in->verbose = verbose;
+
+    in->nn = collect_nodes(cfg, in->nodes, DC_MAX_EPS, err, errlen);
+    if (in->nn < 0) {
+        infer_release(in);
+        return -1;
+    }
+    if (split_stages(&in->m, in->nodes, in->nn, in->owner, &in->nstages, err, errlen) != 0) {
+        infer_release(in);
+        return -1;
+    }
+    in->state = xcalloc((size_t)in->m.n_embd + 8, sizeof(float));
+    if (verbose) print_layout(&in->m, in->nodes, in->nn, in->owner, in->nstages);
+    *out = in;
+    return 0;
+}
+
+/* Заливает веса во все стадии. Собственно подготовка к генерации. */
+int dc_infer_open(dc_config *cfg, const char *model_path, const dc_infer_opts *o,
+                  dc_infer **out, char *err, size_t errlen)
+{
+    dc_infer *in = NULL;
+    if (infer_plan(cfg, model_path, o, &in, err, errlen) != 0) return -1;
+
+    pipeline P = { .m = &in->m, .nodes = in->nodes, .owner = in->owner,
+                   .nstages = in->nstages, .n_embd = in->m.n_embd, .state = in->state };
+    for (int s = 0; s < in->nstages; s++) {
+        if (pipe_deploy_stage(&P, s) != 0) {
+            infer_release(in);
+            return -1;
+        }
+    }
+    *out = in;
+    return 0;
+}
+
+/* Раскладка без заливки весов — для панели и для `llm info`. */
+int dc_infer_layout(dc_config *cfg, const char *model_path, const dc_infer_opts *o,
+                    dc_infer **out, char *err, size_t errlen)
+{
+    return infer_plan(cfg, model_path, o, out, err, errlen);
+}
+
+/* Сбрасывает KV-кэш на всех стадиях: узлы помнят контекст между вызовами,
+ * а каждый новый промпт начинается с чистого листа. */
+static int infer_reset(dc_infer *in, char *err, size_t errlen)
+{
+    for (int s = 0; s < in->nstages; s++) {
+        char *out = NULL;
+        if (pipe_send(in->nodes[in->owner[s]].ep, "reset", &out, err, errlen) != 0) return -1;
+        free(out);
+    }
+    return 0;
+}
+
+char *dc_infer_generate(dc_infer *in, const char *prompt, int max_new,
+                        char *err, size_t errlen)
+{
+    if (!in || !prompt) {
+        snprintf(err, errlen, "конвейер не открыт");
+        return NULL;
+    }
+
+    int *ids = xmalloc(sizeof(int) * DC_PROMPT_TOKENS);
+    int  nid = llm_tok_encode(&in->m.tok, prompt, ids, DC_PROMPT_TOKENS, err, errlen);
+    if (nid < 0) {
+        free(ids);
+        return NULL;
+    }
+
+    /* Позиция в кэше нумеруется с нуля, поэтому для промпта и ответа вместе
+     * нужно на один токен меньше, чем объявленный контекст. */
+    int budget = in->m.n_ctx - 1;
+    if (nid > budget) {
+        snprintf(err, errlen,
+                 "промпт не помещается в контекст: %d токенов нужно, узлы держат %d. "
+                 "Поднимите n_ctx в секции [llm] — но тогда каждому узлу нужно "
+                 "больше памяти под KV-кэш — или сократите цель.",
+                 nid, in->m.n_ctx);
+        free(ids);
+        return NULL;
+    }
+    if (max_new <= 0) max_new = 256;
+    if (max_new > budget - nid) max_new = budget - nid;
+    if (max_new <= 0) {
+        snprintf(err, errlen, "контекста не хватает даже на один токен ответа (%d)", budget);
+        free(ids);
+        return NULL;
+    }
+
+    if (infer_reset(in, err, errlen) != 0) {
+        free(ids);
+        return NULL;
+    }
+
+    pipeline P = { .m = &in->m, .nodes = in->nodes, .owner = in->owner,
+                   .nstages = in->nstages, .n_embd = in->m.n_embd, .state = in->state };
+
+    /* Промпт прогоняется целиком: он не генерируется, а читается, и его выход
+     * — это вход состояния. Последний шаг промпта даёт первый новый токен. */
+    int next = 0;
+    for (int i = 0; i < nid; i++) {
+        next = pipe_step(&P, ids[i], err, errlen);
+        if (next < 0) {
+            free(ids);
+            return NULL;
+        }
+    }
+    free(ids);
+
+    int  eos   = in->m.tok.eos_id;
+    int *gen   = xcalloc((size_t)max_new + 1, sizeof(int));
+    int  ngen  = 0;
+    int  token = nid > 0 ? next : 0;
+
+    for (int i = 0; i < max_new; i++) {
+        if (token == eos) break;
+        gen[ngen++] = token;
+        next = pipe_step(&P, token, err, errlen);
+        if (next < 0) {
+            free(gen);
+            return NULL;
+        }
+        token = next;
+    }
+    in->used = nid + ngen;
+
+    /* Токен на текст даёт примерно 4 байта для кириллицы и 1 для ASCII;
+     * берём с запасом и всё равно проверяем, что влезло. */
+    size_t cap = (size_t)ngen * 8 + 64;
+    char  *text = xmalloc(cap);
+    llm_tok_decode(&in->m.tok, gen, ngen, text, cap);
+    free(gen);
+    return text;
+}
+
+int dc_infer_used(const dc_infer *in)
+{
+    return in ? in->used : 0;
+}
+
+const char *dc_infer_model_path(const dc_infer *in) { return in ? in->path : ""; }
+const char *dc_infer_arch(const dc_infer *in)       { return in && in->m.arch ? in->m.arch : ""; }
+int  dc_infer_n_layer(const dc_infer *in)           { return in ? in->m.n_layer : 0; }
+int  dc_infer_n_embd(const dc_infer *in)            { return in ? in->m.n_embd : 0; }
+int  dc_infer_n_vocab(const dc_infer *in)           { return in ? in->m.n_vocab : 0; }
+int  dc_infer_n_ctx(const dc_infer *in)             { return in ? in->m.n_ctx : 0; }
+int  dc_infer_n_nodes(const dc_infer *in)           { return in ? in->nn : 0; }
+int  dc_infer_n_stages(const dc_infer *in)         { return in ? in->nstages : 0; }
+size_t dc_infer_model_bytes(const dc_infer *in)     { return in ? in->m.size : 0; }
+
+/* Размер словаря в байтах — насколько «жирный» файл модели. */
+int dc_infer_vocab_open(const dc_infer *in)
+{
+    return in && in->m.n_vocab > 0 ? 1 : 0;
+}
+
+void dc_infer_print_layout(const dc_infer *in)
+{
+    if (!in) return;
+    print_layout(&in->m, in->nodes, in->nn, in->owner, in->nstages);
+}
+
+/* Сколько токенов в тексте — см. объявление в shard.h. */
+int llm_model_tokens(const char *model_path, const char *text, int *out,
+                     char *err, size_t errlen)
+{
+    if (!out) return -1;
+    *out = 0;
+    if (!model_path || !text) return -1;
+
+    /* Заголовок со словарём весит единицы мегабайт даже у модели на 150 тысяч
+     * слов. Веса после него планировщику не нужны, поэтому читаем начало
+     * файла, а не весь: на трёхгигабайтной модели это разница между
+     * «секунда» и «вечность». */
+    FILE *f = fopen(model_path, "rb");
+    if (!f) {
+        snprintf(err, errlen, "не удалось открыть %s", model_path);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0) {
+        snprintf(err, errlen, "файл %s пуст", model_path);
+        fclose(f);
+        return -1;
+    }
+
+    long want = fsize;
+    if (want > DC_TOKENIZER_READ_MAX) want = DC_TOKENIZER_READ_MAX;
+    unsigned char *head = xmalloc((size_t)want);
+    size_t         got  = fread(head, 1, (size_t)want, f);
+    fclose(f);
+    if (got == 0) {
+        free(head);
+        snprintf(err, errlen, "%s не читается", model_path);
+        return -1;
+    }
+
+    gguf_file g;
+    char      perr[256] = {0};
+    if (gguf_open(&g, head, got, perr, sizeof perr) != 0) {
+        free(head);
+        snprintf(err, errlen,
+                 "не удалось прочитать словарь модели: %s "
+                 "(заголовок не поместился в %ld байт?)",
+                 perr, got);
+        return -1;
+    }
+
+    llm_tok tok;
+    int     rc = llm_tok_open(&tok, &g, perr, sizeof perr);
+    if (rc == 0) {
+        static int ids[DC_PROMPT_TOKENS];
+        *out = llm_tok_encode(&tok, text, ids, DC_PROMPT_TOKENS, perr, sizeof perr);
+        llm_tok_close(&tok);
+    }
+    gguf_close(&g);
+    free(head);
+
+    if (rc != 0) {
+        snprintf(err, errlen, "токенизатор: %s", perr);
+        return -1;
+    }
+    if (*out < 0) {
+        snprintf(err, errlen, "текст не помещается в %d токенов", DC_PROMPT_TOKENS);
+        *out = 0;
+        return -1;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------- команды --- */
 
 static void usage(void)
@@ -602,145 +914,158 @@ static void usage(void)
     printf(
         "dcctl llm — LLM, разложенная по устройствам\n"
         "\n"
-        "  llm info ФАЙЛ                            раскладка по узлам\n"
-        "  llm deploy ФАЙЛ                          раздать веса по узлам\n"
-        "  llm prompt ФАЙЛ \"текст\" [токенов]       генерация с проверкой\n"
+        "  llm info [ФАЙЛ]                          раскладка по узлам\n"
+        "  llm deploy [ФАЙЛ]                        раздать веса по узлам\n"
+        "  llm prompt [ФАЙЛ] \"текст\" [токенов]      генерация с проверкой\n"
+        "  llm check [ФАЙЛ]                         готов ли планировщик\n"
         "\n"
-        "Модель читается из GGUF (F32/F16, архитектура llama). Узлы берутся из\n"
-        "секции [role %s]: стадии раскладываются по их свободной памяти.\n",
+        "ФАЙЛ — модель GGUF (F32/F16, архитектура llama). Если не указан, берётся\n"
+        "model_file из секции [llm]. Узлы — из [role %s]: стадии раскладываются по\n"
+        "их свободной памяти, по сети идёт активация, а не модель.\n",
         ROLE_SHARD);
 }
 
-static int cmd_info(dc_config *cfg, llm_model *m, char *err, size_t errlen)
+/* Модель из аргумента, иначе из конфигурации. */
+static const char *model_arg(const dc_config *cfg, int argc, char **argv, char *err,
+                             size_t errlen)
 {
-    llm_node nodes[DC_MAX_EPS];
-    int      owner[512];
-    int      nn = collect_nodes(cfg, nodes, DC_MAX_EPS, err, errlen);
-    if (nn < 0) return 3;
+    if (argc > 0 && argv[0] && argv[0][0] && argv[0][0] != '-') return argv[0];
+    if (cfg->model_file && *cfg->model_file) return cfg->model_file;
+    snprintf(err, errlen,
+             "не задана модель: укажите файл аргументом или model_file в секции [llm]");
+    return NULL;
+}
 
-    printf("Модель: %s, слоёв %d, embd %d, голов %d/%d, ff %d, словарь %d, %zu байт\n",
-           m->arch, m->n_layer, m->n_embd, m->n_head, m->n_head_kv, m->n_ff, m->n_vocab,
-           m->size);
-    for (int k = 0; k < nn; k++)
-        printf("узел %-24s свободно %ld байт под модель, примет до %d байт\n",
-               nodes[k].ep->url, nodes[k].cap, nodes[k].ep->cap.max_body);
+static dc_infer_opts opts_from(const dc_config *cfg, int verbose)
+{
+    dc_infer_opts o = { .n_ctx = cfg->n_ctx, .verbose = verbose };
+    return o;
+}
 
-    int nstages = 0;
-    if (split_stages(m, nodes, nn, owner, &nstages, err, errlen) != 0) {
+static int cmd_info(dc_config *cfg, int argc, char **argv, char *err, size_t errlen)
+{
+    const char *path = model_arg(cfg, argc, argv, err, errlen);
+    if (!path) {
+        printf("%s\n", err);
+        return 2;
+    }
+
+    /* info ничего не заливает: спрашиваются только PING */
+    dc_infer      *in = NULL;
+    dc_infer_opts  o  = opts_from(cfg, 0);
+    if (dc_infer_layout(cfg, path, &o, &in, err, errlen) != 0) {
         printf("\nраскладка невозможна: %s\n", err);
         return 4;
     }
-    print_layout(m, nodes, nn, owner, nstages);
+
+    printf("Модель: %s, слоёв %d, embd %d, слов %d, контекст %d токенов, %zu байт\n",
+           dc_infer_arch(in), dc_infer_n_layer(in), dc_infer_n_embd(in),
+           dc_infer_n_vocab(in), dc_infer_n_ctx(in), dc_infer_model_bytes(in));
+    printf("узлов роли %s: %d\n", ROLE_SHARD, dc_infer_n_nodes(in));
+    dc_infer_print_layout(in);
+    dc_infer_free(in);
     return 0;
 }
 
-static int cmd_deploy(dc_config *cfg, llm_model *m, char *err, size_t errlen)
+static int cmd_deploy(dc_config *cfg, int argc, char **argv, char *err, size_t errlen)
 {
-    llm_node nodes[DC_MAX_EPS];
-    int      owner[512];
-    int      nn = collect_nodes(cfg, nodes, DC_MAX_EPS, err, errlen);
-    if (nn < 0) return 3;
-    int nstages = 0;
-    if (split_stages(m, nodes, nn, owner, &nstages, err, errlen) != 0) {
+    const char *path = model_arg(cfg, argc, argv, err, errlen);
+    if (!path) {
+        printf("%s\n", err);
+        return 2;
+    }
+
+    dc_infer      *in = NULL;
+    dc_infer_opts  o  = opts_from(cfg, 1);
+    if (dc_infer_open(cfg, path, &o, &in, err, errlen) != 0) {
         printf("\nраздать нечего: %s\n", err);
         return 4;
     }
-    print_layout(m, nodes, nn, owner, nstages);
-
-    int sock = udp_socket_client(err, errlen);
-    if (sock < 0) return 3;
-
-    pipeline P = { .sock = sock, .m = m, .nodes = nodes, .owner = owner,
-                   .nstages = nstages, .n_embd = m->n_embd };
-    for (int s = 0; s < nstages; s++) {
-        printf("стадия %d -> %s\n", s, nodes[owner[s]].ep->url);
-        if (pipe_deploy_stage(&P, s) != 0) {
-            close(sock);
-            return 1;
-        }
-    }
-    close(sock);
-    printf("\nВеса разложены. Дальше: dcctl llm prompt %s \"текст\"\n", "МОДЕЛЬ");
+    printf("\nВеса разложены по %d узлам. Дальше: dcctl llm prompt \"%s\" \"текст\"\n",
+           dc_infer_n_nodes(in), path);
+    dc_infer_free(in);
     return 0;
 }
 
-static int cmd_prompt(dc_config *cfg, llm_model *m, int argc, char **argv, char *err,
-                      size_t errlen)
+/* Генерация с обязательной сверкой: та же модель считается целиком на
+ * планировщике, и каждый токен сравнивается с тем, что вернул конвейер.
+ * Расхождение означает, что где-то потерялись веса или активация. */
+static int cmd_prompt(dc_config *cfg, int argc, char **argv, char *err, size_t errlen)
 {
-    const char *prompt = argc > 0 ? argv[0] : "distcomp";
-    int   ngen = argc > 1 ? atoi(argv[1]) : 8;
+    const char *path   = model_arg(cfg, argc, argv, err, errlen);
+    const char *prompt = (argc > 1 && argv[1]) ? argv[1] : "distcomp";
+    int         ngen   = argc > 2 ? atoi(argv[2]) : 8;
+    if (!path) {
+        printf("%s\n", err);
+        return 2;
+    }
     if (ngen < 1) ngen = 1;
     if (ngen > 256) ngen = 256;
 
-    /* промпт -> токены */
-    int ids[4096];
-    int nid = llm_tok_encode(&m->tok, prompt, ids, (int)(sizeof ids / sizeof ids[0]), err, errlen);
-    if (nid < 0) return 2;
-
-    char text[4096];
-    llm_tok_decode(&m->tok, ids, nid, text, sizeof text);
-    printf("Промпт: «%s»\n", text);
-    printf("Токенов в промпте: %d\n", nid);
-
-    llm_node nodes[DC_MAX_EPS];
-    int      owner[512];
-    int      nn = collect_nodes(cfg, nodes, DC_MAX_EPS, err, errlen);
-    if (nn < 0) return 3;
-    int nstages = 0;
-    if (split_stages(m, nodes, nn, owner, &nstages, err, errlen) != 0) {
+    dc_infer      *in = NULL;
+    dc_infer_opts  o  = opts_from(cfg, 1);
+    if (dc_infer_open(cfg, path, &o, &in, err, errlen) != 0) {
         printf("\nвыполнить нечем: %s\n", err);
         return 4;
     }
-    print_layout(m, nodes, nn, owner, nstages);
 
-    int sock = udp_socket_client(err, errlen);
-    if (sock < 0) return 3;
+    /* промпт -> токены */
+    int ids[DC_PROMPT_TOKENS];
+    int nid = llm_tok_encode(&in->m.tok, prompt, ids, DC_PROMPT_TOKENS, err, errlen);
+    if (nid < 0) {
+        dc_infer_free(in);
+        return 2;
+    }
+    if (nid > in->m.n_ctx - 1) {
+        fprintf(stderr,
+                "промпт не помещается в контекст: %d токенов нужно, узлы держат %d\n", nid,
+                in->m.n_ctx);
+        dc_infer_free(in);
+        return 2;
+    }
 
-    pipeline P = { .sock = sock, .m = m, .nodes = nodes, .owner = owner,
-                   .nstages = nstages, .n_embd = m->n_embd,
-                   .state = xcalloc((size_t)m->n_embd + 8, sizeof(float)) };
-    for (int s = 0; s < nstages; s++)
-        if (pipe_deploy_stage(&P, s) != 0) {
-            free(P.state);
-            close(sock);
-            return 1;
-        }
+    char text[4096];
+    llm_tok_decode(&in->m.tok, ids, nid, text, sizeof text);
+    printf("Промпт: «%s»\n", text);
+    printf("Токенов в промпте: %d\n", nid);
 
-    /* локальный эталон */
+    /* эталон: та же модель целиком, на планировщике */
     local_run L;
-    if (local_open(&L, m, err, errlen) != 0) {
-        free(P.state);
-        close(sock);
+    if (local_open(&L, &in->m, err, errlen) != 0) {
+        fprintf(stderr, "эталон не собрался: %s\n", err);
+        dc_infer_free(in);
         return 1;
     }
 
+    pipeline P = { .m = &in->m, .nodes = in->nodes, .owner = in->owner,
+                   .nstages = in->nstages, .n_embd = in->m.n_embd, .state = in->state };
+
     printf("\nГенерация (жадная):\n\n");
-    int bad = 0;
-    int tok = 0;
+    int bad  = 0;
     int last = 0;
 
-    /* промпт: и эталон, и конвейер прогоняют его целиком и копят контекст.
-     * Выход последнего шага промпта — это первый сгенерированный токен. */
+    /* Промпт прогоняют оба: он копит контекст, и выход его последнего шага —
+     * первый сгенерированный токен. */
     for (int i = 0; i < nid; i++) {
-        tok = ids[i];
-        if (local_forward(&L, tok) < 0) {
-            fprintf(stderr, "эталон не смог обработать токен %d\n", tok);
-            local_free(&L); free(P.state); close(sock);
+        if (local_forward(&L, ids[i]) < 0) {
+            fprintf(stderr, "эталон не смог обработать токен %d\n", ids[i]);
+            local_free(&L);
+            dc_infer_free(in);
             return 1;
         }
-        int got = pipe_step(&P, tok, err, errlen);
+        int got = pipe_step(&P, ids[i], err, errlen);
         if (got < 0) {
-            fprintf(stderr, "конвейер не смог обработать токен %d: %s\n", tok, err);
-            local_free(&L); free(P.state); close(sock);
+            fprintf(stderr, "конвейер не смог обработать токен %d: %s\n", ids[i], err);
+            local_free(&L);
+            dc_infer_free(in);
             return 1;
         }
-        printf("%d ", tok);
+        printf("%d ", ids[i]);
         fflush(stdout);
         last = got;
     }
-    tok = nid > 0 ? last : 0;
+    int tok = nid > 0 ? last : 0;
 
-    /* генерация: печатаем токен, затем сверяем шаг обоих прогонов на одном входе */
     for (int i = 0; i < ngen; i++) {
         printf("%d ", tok);
         fflush(stdout);
@@ -748,7 +1073,8 @@ static int cmd_prompt(dc_config *cfg, llm_model *m, int argc, char **argv, char 
         int got = pipe_step(&P, tok, err, errlen);
         if (got < 0) {
             fprintf(stderr, "\nконвейер не смог обработать токен %d: %s\n", tok, err);
-            local_free(&L); free(P.state); close(sock);
+            local_free(&L);
+            dc_infer_free(in);
             return 1;
         }
         if (got != ref) bad++;
@@ -757,8 +1083,7 @@ static int cmd_prompt(dc_config *cfg, llm_model *m, int argc, char **argv, char 
     printf("\n");
 
     local_free(&L);
-    free(P.state);
-    close(sock);
+    dc_infer_free(in);
 
     if (bad) {
         printf("\nСверка: расхождение в %d токенах из %d — конвейер считает\n"
@@ -769,42 +1094,51 @@ static int cmd_prompt(dc_config *cfg, llm_model *m, int argc, char **argv, char 
     return 0;
 }
 
+/* check: то же, о чём думает планировщик, когда строит план. */
+static int cmd_check(dc_config *cfg, int argc, char **argv, char *err, size_t errlen)
+{
+    const char *path = model_arg(cfg, argc, argv, err, errlen);
+    if (!path) {
+        printf("%s\n", err);
+        return 3;
+    }
+
+    printf("модель: %s\n", path);
+    printf("узлы:   %s\n", ROLE_SHARD);
+
+    dc_infer      *in = NULL;
+    dc_infer_opts  o  = opts_from(cfg, 0);
+    if (dc_infer_layout(cfg, path, &o, &in, err, errlen) != 0) {
+        printf("\nготово: нет — %s\n", err);
+        return 3;
+    }
+
+    printf("\nархитектура:    %s\n", dc_infer_arch(in));
+    printf("слоёв:          %d\n", dc_infer_n_layer(in));
+    printf("размер вектора: %d\n", dc_infer_n_embd(in));
+    printf("словарь:        %d\n", dc_infer_n_vocab(in));
+    printf("контекст:       %d токенов\n", dc_infer_n_ctx(in));
+    printf("размер файла:   %zu байт\n", dc_infer_model_bytes(in));
+    dc_infer_print_layout(in);
+    printf("готово: план можно строить локально, ключи и внешний сервер не нужны.\n");
+    dc_infer_free(in);
+    return 0;
+}
+
 int shard_cmd(dc_config *cfg, int argc, char **argv, char *err, size_t errlen)
 {
-    if (argc < 1) {
+    if (argc < 1 || !argv[0]) {
         usage();
         return 2;
     }
     const char *sub = argv[0];
-    if (argc < 2) {
-        usage();
-        return 2;
-    }
-    const char *path = argv[1];
 
-    llm_model m;
-    /* ограничения узлов (max_body и free_mem) приходят из PONG: без опроса
-     * раскладка была бы вслепую */
-    if (sched_learn_caps(cfg) == 0) {
-        snprintf(err, errlen,
-                 "не удалось опросить узлы роли %s: они не отвечают или не сообщили "
-                 "свободной памяти (free_mem)",
-                 ROLE_SHARD);
-        return 3;
-    }
-    if (llm_open_file(&m, path, err, errlen) != 0) return 3;
+    if (strcmp(sub, "info") == 0)   return cmd_info(cfg, argc - 1, argv + 1, err, errlen);
+    if (strcmp(sub, "deploy") == 0) return cmd_deploy(cfg, argc - 1, argv + 1, err, errlen);
+    if (strcmp(sub, "prompt") == 0) return cmd_prompt(cfg, argc - 1, argv + 1, err, errlen);
+    if (strcmp(sub, "check") == 0)  return cmd_check(cfg, argc - 1, argv + 1, err, errlen);
 
-    int rc;
-    if (strcmp(sub, "info") == 0) {
-        rc = cmd_info(cfg, &m, err, errlen);
-    } else if (strcmp(sub, "deploy") == 0) {
-        rc = cmd_deploy(cfg, &m, err, errlen);
-    } else if (strcmp(sub, "prompt") == 0) {
-        rc = cmd_prompt(cfg, &m, argc - 2, argv + 2, err, errlen);
-    } else {
-        snprintf(err, errlen, "неизвестная подкоманда llm: %s", sub);
-        rc = 2;
-    }
-    llm_free(&m);
-    return rc;
+    snprintf(err, errlen, "неизвестная подкоманда llm: %s", sub);
+    usage();
+    return 2;
 }

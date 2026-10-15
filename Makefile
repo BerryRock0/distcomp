@@ -2,18 +2,25 @@ CC      ?= gcc
 CFLAGS  ?= -O2 -g
 CFLAGS  += -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-parameter -pthread
 LDFLAGS +=
-LDLIBS  += -lssl -lcrypto -lpthread -lm
+# OpenSSL больше не нужен: HTTP-клиент остался только ради обращения к чужому
+# LLM-серверу, а планирование теперь ведёт локальная модель, разложенная по
+# узлам. Сборка стала без единой внешней библиотеки.
+LDLIBS  += -lpthread -lm
 
 SRC  := src
 BUILD := build
 BIN  := bin
 
-COMMON_SRC := $(SRC)/util.c $(SRC)/json.c $(SRC)/http.c $(SRC)/conf.c \
+COMMON_SRC := $(SRC)/util.c $(SRC)/json.c $(SRC)/conf.c \
               $(SRC)/plan.c $(SRC)/llm.c $(SRC)/sched.c $(SRC)/expr.c $(SRC)/udp.c \
+              $(SRC)/tcp.c $(SRC)/dtn.c $(SRC)/xport.c $(SRC)/shard.c \
               $(SRC)/tty.c $(SRC)/gguf.c $(SRC)/engine.c $(SRC)/tok.c
 COMMON_OBJ := $(COMMON_SRC:$(SRC)/%.c=$(BUILD)/%.o)
 
-CTL_OBJ   := $(BUILD)/main.o $(BUILD)/web.o $(BUILD)/ui.o $(BUILD)/shard.o $(BUILD)/tty.o
+# shard.c попал в общие объекты потому, что планирование зовёт его движок:
+# модель, разложенная по узлам, теперь строит план сама, а не просить его
+# у внешнего сервера.
+CTL_OBJ   := $(BUILD)/main.o $(BUILD)/web.o $(BUILD)/ui.o
 DAEMON_OBJ := $(BUILD)/daemon.o
 
 ALL_OBJ := $(COMMON_OBJ) $(CTL_OBJ) $(DAEMON_OBJ)
@@ -59,6 +66,9 @@ $(BIN)/expr_test: $(BUILD)/expr.o $(BUILD)/util.o tests/expr_test.c | $(BIN)
 
 lite: $(LITE)
 
+# Лёгкая сборка: только UDP. TCP и DTN — это потоковые транспорты, а на
+# микроконтроллере их нет и не нужно: туда ложится ровно то, ради чего lite
+# и делается, — маленький бинарник с одним циклом и одним сокетом.
 $(LITE): $(BUILD)/daemon_lite.o $(BUILD)/util_lite.o $(BUILD)/json_lite.o \
          $(BUILD)/conf_lite.o $(BUILD)/expr_lite.o $(BUILD)/udp_lite.o \
          $(BUILD)/gguf_lite.o $(BUILD)/engine_lite.o $(BUILD)/tok_lite.o | $(BIN)
@@ -81,19 +91,21 @@ lite-size-bytes: $(LITE)
 # автозависимости по заголовкам
 $(BUILD)/util.o:    $(SRC)/util.h
 $(BUILD)/json.o:    $(SRC)/json.h  $(SRC)/util.h
-$(BUILD)/http.o:    $(SRC)/http.h  $(SRC)/util.h
 $(BUILD)/conf.o:    $(SRC)/conf.h  $(SRC)/util.h
 $(BUILD)/plan.o:    $(SRC)/plan.h  $(SRC)/tty.h  $(SRC)/conf.h $(SRC)/json.h $(SRC)/util.h
-$(BUILD)/llm.o:     $(SRC)/llm.h   $(SRC)/conf.h $(SRC)/plan.h $(SRC)/http.h $(SRC)/json.h $(SRC)/expr.h
-$(BUILD)/sched.o:   $(SRC)/sched.h $(SRC)/tty.h $(SRC)/plan.h $(SRC)/conf.h $(SRC)/http.h $(SRC)/json.h
 $(BUILD)/expr.o:    $(SRC)/expr.h  $(SRC)/util.h
 $(BUILD)/udp.o:     $(SRC)/udp.h   $(SRC)/util.h
+$(BUILD)/tcp.o:     $(SRC)/tcp.h   $(SRC)/util.h
+$(BUILD)/dtn.o:     $(SRC)/dtn.h   $(SRC)/tcp.h $(SRC)/util.h
+$(BUILD)/xport.o:   $(SRC)/xport.h $(SRC)/conf.h $(SRC)/udp.h $(SRC)/tcp.h $(SRC)/dtn.h $(SRC)/util.h
+$(BUILD)/llm.o:     $(SRC)/llm.h   $(SRC)/conf.h $(SRC)/plan.h $(SRC)/shard.h $(SRC)/json.h $(SRC)/util.h $(SRC)/expr.h
+$(BUILD)/sched.o:   $(SRC)/sched.h $(SRC)/tty.h $(SRC)/plan.h $(SRC)/conf.h $(SRC)/xport.h $(SRC)/json.h
 $(BUILD)/main.o:    $(SRC)/tty.h $(SRC)/conf.h $(SRC)/plan.h $(SRC)/llm.h $(SRC)/sched.h $(SRC)/util.h $(SRC)/web.h $(SRC)/shard.h
-$(BUILD)/web.o:     $(SRC)/web.h  $(SRC)/conf.h $(SRC)/plan.h $(SRC)/llm.h $(SRC)/sched.h $(SRC)/json.h $(SRC)/util.h
+$(BUILD)/web.o:     $(SRC)/web.h  $(SRC)/conf.h $(SRC)/plan.h $(SRC)/llm.h $(SRC)/sched.h $(SRC)/json.h $(SRC)/util.h $(SRC)/shard.h
 $(BUILD)/ui.o:      $(SRC)/web.h
-$(BUILD)/shard.o:   $(SRC)/shard.h $(SRC)/conf.h $(SRC)/plan.h $(SRC)/sched.h $(SRC)/json.h \
+$(BUILD)/shard.o:   $(SRC)/shard.h $(SRC)/conf.h $(SRC)/sched.h $(SRC)/json.h $(SRC)/xport.h \
                     $(SRC)/util.h $(SRC)/engine.h $(SRC)/gguf.h
-$(BUILD)/daemon.o:  $(SRC)/conf.h $(SRC)/json.h $(SRC)/expr.h $(SRC)/udp.h $(SRC)/util.h \
+$(BUILD)/daemon.o:  $(SRC)/conf.h $(SRC)/json.h $(SRC)/expr.h $(SRC)/udp.h $(SRC)/tcp.h $(SRC)/dtn.h $(SRC)/util.h \
                     $(SRC)/engine.h $(SRC)/gguf.h
 $(BUILD)/daemon_lite.o $(BUILD)/engine_lite.o $(BUILD)/gguf_lite.o $(BUILD)/tok_lite.o: \
                       $(SRC)/engine.h $(SRC)/gguf.h $(SRC)/tok.h

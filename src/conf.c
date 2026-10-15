@@ -44,33 +44,24 @@ static char *expand_value(const char *val)
 dc_config *conf_new(void)
 {
     dc_config *cfg = xcalloc(1, sizeof *cfg);
-    cfg->llm_url = xstrdup("https://api.openai.com/v1/chat/completions");
-    cfg->llm_model = xstrdup("gpt-4o-mini");
-    cfg->llm_style = xstrdup("openai");
-    cfg->llm_json_mode = xstrdup("auto");
-    cfg->llm_auth = xstrdup("auto");
-    cfg->llm_temp = 0.0;
-    cfg->llm_timeout_ms = 120000;
+    /* Модели по умолчанию нет: без неё план строится эвристикой, и об этом
+     * честно говорит llm check, а не молчаливый откат. */
+    cfg->model_file   = xstrdup("");
+    cfg->n_ctx        = 0;      /* 0 — движок подставит разумное значение */
+    cfg->max_new      = 512;
     cfg->payload_mode = xstrdup("expr");
-    cfg->concurrency = 4;
-    cfg->retries = 2;
-    cfg->timeout_ms = 60000;
-    cfg->backoff_ms = 500;
-    cfg->outdir = xstrdup("runs");
+    cfg->concurrency  = 4;
+    cfg->retries      = 2;
+    cfg->timeout_ms   = 60000;
+    cfg->backoff_ms   = 500;
+    cfg->outdir       = xstrdup("runs");
     return cfg;
 }
 
 void conf_free(dc_config *cfg)
 {
     if (!cfg) return;
-    free(cfg->llm_url);
-    free(cfg->llm_model);
-    free(cfg->llm_key);
-    free(cfg->llm_style);
-    free(cfg->llm_auth_header);
-    free(cfg->llm_extra_header);
-    free(cfg->llm_json_mode);
-    free(cfg->llm_auth);
+    free(cfg->model_file);
     free(cfg->payload_mode);
     free(cfg->outdir);
     for (int i = 0; i < cfg->nroles; i++) {
@@ -115,22 +106,15 @@ dc_config *conf_clone(const dc_config *src)
 {
     if (!src) return NULL;
     dc_config *d = conf_new();
-    set_str(&d->llm_url, src->llm_url);
-    set_str(&d->llm_model, src->llm_model);
-    set_str(&d->llm_key, src->llm_key);
-    set_str(&d->llm_style, src->llm_style);
-    set_str(&d->llm_auth_header, src->llm_auth_header);
-    set_str(&d->llm_extra_header, src->llm_extra_header);
-    set_str(&d->llm_json_mode, src->llm_json_mode);
-    set_str(&d->llm_auth, src->llm_auth);
+    set_str(&d->model_file, src->model_file);
     set_str(&d->payload_mode, src->payload_mode);
     set_str(&d->outdir, src->outdir);
-    d->llm_timeout_ms = src->llm_timeout_ms;
-    d->llm_temp = src->llm_temp;
-    d->concurrency = src->concurrency;
-    d->retries = src->retries;
-    d->timeout_ms = src->timeout_ms;
-    d->backoff_ms = src->backoff_ms;
+    d->n_ctx        = src->n_ctx;
+    d->max_new      = src->max_new;
+    d->concurrency  = src->concurrency;
+    d->retries      = src->retries;
+    d->timeout_ms   = src->timeout_ms;
+    d->backoff_ms   = src->backoff_ms;
 
     d->nroles = 0;
     for (int i = 0; i < src->nroles && d->nroles < DC_MAX_ROLES; i++) {
@@ -247,17 +231,11 @@ dc_config *conf_load(const char *path, char *err, size_t errlen)
         }
 
         if (str_ieq(section, "llm")) {
-            if (str_ieq(key, "url"))                    set_str(&cfg->llm_url, value);
-            else if (str_ieq(key, "model"))             set_str(&cfg->llm_model, value);
-            else if (str_ieq(key, "api_key"))           set_str(&cfg->llm_key, value);
-            else if (str_ieq(key, "style"))             set_str(&cfg->llm_style, value);
-            else if (str_ieq(key, "auth_header"))       set_str(&cfg->llm_auth_header, value);
-            else if (str_ieq(key, "extra_header"))      set_str(&cfg->llm_extra_header, value);
-            else if (str_ieq(key, "json_mode"))        set_str(&cfg->llm_json_mode, value);
-            else if (str_ieq(key, "auth"))             set_str(&cfg->llm_auth, value);
-            else if (str_ieq(key, "timeout_ms"))        cfg->llm_timeout_ms = strtol(value, NULL, 10);
-            else if (str_ieq(key, "temperature"))       cfg->llm_temp = strtod(value, NULL);
-            else if (str_ieq(key, "payload_mode"))      set_str(&cfg->payload_mode, value);
+            if (str_ieq(key, "model_file"))       set_str(&cfg->model_file, value);
+            else if (str_ieq(key, "model"))        set_str(&cfg->model_file, value);
+            else if (str_ieq(key, "n_ctx"))        cfg->n_ctx = (int)strtol(value, NULL, 10);
+            else if (str_ieq(key, "max_new"))      cfg->max_new = (int)strtol(value, NULL, 10);
+            else if (str_ieq(key, "payload_mode")) set_str(&cfg->payload_mode, value);
             else log_debug("неизвестный ключ llm.%s", key);
         } else if (str_ieq(section, "scheduler")) {
             if (str_ieq(key, "concurrency"))     cfg->concurrency = (int)strtol(value, NULL, 10);
@@ -291,20 +269,19 @@ int conf_save_example(const char *path)
         "# Пользователь сам решает, какой узел какую роль обслуживает.\n"
         "\n"
         "[llm]\n"
-        "# любой OpenAI-совместимый endpoint\n"
-        "url          = https://api.openai.com/v1/chat/completions\n"
-        "model        = gpt-4o-mini\n"
-        "api_key      = $OPENAI_API_KEY     # можно $ПЕРЕМЕННАЯ или пусто\n"
-        "style        = openai              # openai | anthropic\n"
-        "json_mode    = auto                # auto | on | off (принудительный JSON-режим)\n"
-        "auth         = auto                # auto | none | bearer (none — сервер без ключа)\n"
-        "timeout_ms   = 120000\n"
-        "temperature  = 0\n"
-        "payload_mode = expr                # expr — payload это арифметика; free — произвольный текст\n"
+        "# Модель, которая разлагает цель на шаги. Это не внешний сервер: файл GGUF\n"
+        "# читается локально, а его веса раскладываются по узлам роли %s.\n"
+        "# Пока model_file пуст, план строится эвристикой.\n"
+        "model_file  = model.gguf\n"
+        "n_ctx       = 1024            # токенов контекста; больше — узлам нужно\n"
+        "                             # больше памяти под KV-кэш (потолок 4096)\n"
+        "max_new     = 512             # сколько токенов модель может нагенерировать\n"
+        "payload_mode = expr           # expr — payload это арифметика; free — произвольный текст\n"
         "\n"
         "[role %s]\n"
-        "daemon = 127.0.0.1:9101       # вычисления (host:port, транспорт UDP)\n"
+        "daemon = 127.0.0.1:9101       # вычисления (host:port)\n"
         "daemon = 127.0.0.1:9102       # второй вычислитель (балансировка)\n"
+        "daemon = tcp://127.0.0.1:9111 # тот же узел через TCP, если UDP не годится\n"
         "\n"
         "[role %s]\n"
         "daemon = 127.0.0.1:9103       # проверка\n"
@@ -312,13 +289,20 @@ int conf_save_example(const char *path)
         "[role %s]\n"
         "daemon = 127.0.0.1:9104       # запоминание\n"
         "\n"
+        "[role %s]\n"
+        "# Устройства, на которых живут веса модели. Нужно минимум три:\n"
+        "# вход (эмбеддинг), слои и выход (голова) обязаны быть на разных узлах.\n"
+        "daemon = 127.0.0.1:9105\n"
+        "daemon = 127.0.0.1:9106\n"
+        "daemon = 127.0.0.1:9107\n"
+        "\n"
         "[scheduler]\n"
         "concurrency = 4\n"
         "retries     = 2\n"
         "timeout_ms  = 60000\n"
         "backoff_ms  = 500\n"
         "outdir      = runs\n",
-        ROLE_COMPUTE, ROLE_VERIFY, ROLE_MEMORIZE);
+        ROLE_SHARD, ROLE_COMPUTE, ROLE_VERIFY, ROLE_MEMORIZE, ROLE_SHARD);
     fclose(f);
     return 0;
 }

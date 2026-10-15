@@ -2,6 +2,8 @@
 #include "expr.h"
 #include "engine.h"
 #include "udp.h"
+#include "tcp.h"
+#include "dtn.h"
 #include "util.h"
 
 #include <arpa/inet.h>
@@ -72,6 +74,18 @@
 #define DC_HELLO_SECS 10
 #endif
 
+/*
+ * Лёгкая сборка для микроконтроллеров: там нет ни TCP-стека в привычном виде,
+ * ни смысла в нём. Поэтому потоковые транспорты в неё не попадают вовсе, и
+ * размер, ради которого всё затевалось, остаётся прежним: один цикл, один
+ * сокет, один буфер в BSS.
+ */
+#ifdef DC_LITE
+#define DC_HAS_STREAMS 0
+#else
+#define DC_HAS_STREAMS 1
+#endif
+
 /* Сколько байт весов узел готов держать в ОЗУ под части модели. Веса
  * лежат в статическом пуле: узел по построению работает без malloc,
  * а веса должны жить в памяти постоянно, а не выделяться под каждый
@@ -92,6 +106,9 @@ typedef struct {
     char state_dir[256];
     long served;
     long free_mem;          /* сколько пула отдаём под модель */
+    int  use_tcp;           /* слушать TCP порт */
+    int  use_dtn;           /* использовать DTN поверх TCP */
+    char dtn_queue[256];    /* каталог очереди DTN */
 } node;
 
 static node N;   /* единственный экземпляр — в BSS, без malloc */
@@ -1100,6 +1117,54 @@ static void role_shard(const req_t *r, char *out, size_t outsz, char *detail, si
 }
 
 /* -------------------------------------------------------- ответ ---- */
+/*
+ * Ответы собираются в reply_buf тремя сборщиками — json_ok, json_err,
+ * json_pong — а отправляются по-разному в зависимости от транспорта:
+ * дейтаграммой или кадром в потоке. Содержимое у них одно, поэтому и
+ * собирается оно в одном месте: правило ответа одно на все транспорты.
+ */
+
+/* Ошибка до разбора запроса или сверх лимита — тот же формат, что у ролей:
+ * планировщик читает ok/error/max_body/node в любом ответе. */
+static void json_err(buf_t *b, const char *msg)
+{
+    binit(b, reply_buf, sizeof reply_buf);
+    badd(b, "{\"ok\":false,\"error\":");
+    badd_json(b, msg);
+    badd(b, ",\"max_body\":");
+    badd_u(b, (unsigned long)N.max_body);
+    badd(b, ",\"node\":");
+    badd_json(b, N.tag);
+    badd(b, "}");
+}
+
+/* PONG: планировщик запоминает max_body и больше не присылает этому узлу
+ * слишком тяжёлые шаги, а по free_mem раскладывает модель. */
+static void json_pong(buf_t *b)
+{
+    binit(b, reply_buf, sizeof reply_buf);
+    badd(b, "{\"ok\":true,\"node\":");
+    badd_json(b, N.tag);
+    badd(b, ",\"arch\":");
+    badd_json(b, DC_ARCH);
+    badd(b, ",\"max_body\":");
+    badd_u(b, (unsigned long)N.max_body);
+    /* сколько памяти отдаём под веса модели и что уже держим */
+    badd(b, ",\"free_mem\":");
+    badd_u(b, (unsigned long)N.free_mem);
+    badd(b, ",\"shard\":");
+    {
+        char sdesc[96];
+        shard_describe(sdesc, sizeof sdesc);
+        badd_json(b, sdesc);
+    }
+    badd(b, ",\"roles\":\"");
+    for (int i = 0; i < N.nroles; i++) {
+        if (i) badd(b, ",");
+        badd(b, role_name(N.serve[i]));
+    }
+    badd(b, "\"}");
+}
 
 static void send_reply(int fd, const struct sockaddr_in *to, const char *json)
 {
@@ -1111,49 +1176,17 @@ static void send_reply(int fd, const struct sockaddr_in *to, const char *json)
     }
 }
 
-/* Ошибка до разбора запроса/лимита — тот же формаT, что у ролей:
- * планировщик читает ok/error/max_body/node в любом ответе. */
 static void send_error(int fd, const struct sockaddr_in *to, const char *msg)
 {
     buf_t b;
-    binit(&b, reply_buf, sizeof reply_buf);
-    badd(&b, "{\"ok\":false,\"error\":");
-    badd_json(&b, msg);
-    badd(&b, ",\"max_body\":");
-    badd_u(&b, (unsigned long)N.max_body);
-    badd(&b, ",\"node\":");
-    badd_json(&b, N.tag);
-    badd(&b, "}");
+    json_err(&b, msg);
     send_reply(fd, to, reply_buf);
 }
 
-/* PING -> PONG: планировщик запоминает max_body и больше не присылает
- * этому узлу слишком тяжёлые шаги. */
 static void send_pong(int fd, const struct sockaddr_in *to)
 {
     buf_t b;
-    binit(&b, reply_buf, sizeof reply_buf);
-    badd(&b, "{\"ok\":true,\"node\":");
-    badd_json(&b, N.tag);
-    badd(&b, ",\"arch\":");
-    badd_json(&b, DC_ARCH);
-    badd(&b, ",\"max_body\":");
-    badd_u(&b, (unsigned long)N.max_body);
-    /* сколько памяти отдаём под веса модели и что уже держим */
-    badd(&b, ",\"free_mem\":");
-    badd_u(&b, (unsigned long)N.free_mem);
-    badd(&b, ",\"shard\":");
-    {
-        char sdesc[96];
-        shard_describe(sdesc, sizeof sdesc);
-        badd_json(&b, sdesc);
-    }
-    badd(&b, ",\"roles\":\"");
-    for (int i = 0; i < N.nroles; i++) {
-        if (i) badd(&b, ",");
-        badd(&b, role_name(N.serve[i]));
-    }
-    badd(&b, "\"}");
+    json_pong(&b);
     send_reply(fd, to, reply_buf);
 }
 
@@ -1222,6 +1255,145 @@ static void build_reply(const req_t *r, buf_t *res)
     badd(res, "}");
 }
 
+/* ------------------------------------------------- обслуживание потока --- */
+/*
+ * Один и тот же разбор запроса для UDP, TCP и DTN: тело одинаковое, разница
+ * только в рамке. Поэтому ниже ровно одна копия «что делать с запросом», а
+ * транспортные обёртки только читают и пишут кадры.
+ */
+
+/* Сколько молчим, прежде чем считать соединение закрытым. */
+#define DC_STREAM_IDLE_MS 30000
+
+static int stream_wait_readable(int fd, int ms)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    int n = poll(&pfd, 1, ms);
+    if (n < 0) return errno == EINTR ? 0 : -1;
+    return n;
+}
+
+/* Отправляет собранный JSON в поток: TCP — кадром, DTN — bundle'ом.
+ * Номер bundle у DTN нужен, чтобы клиент подтвердил приём. */
+static int stream_write_reply(int fd, int is_dtn, uint32_t bundle_id, const char *json)
+{
+    unsigned char *msg = NULL;
+    size_t         len = 0;
+    int            rc;
+
+    if (is_dtn)
+        rc = dtn_pack(DC_DTN_MSG_RESPONSE, bundle_id, json, strlen(json), &msg, &len);
+    else
+        rc = tcp_pack(DC_TCP_MSG_RESPONSE, json, &msg, &len);
+    if (rc != 0) return -1;
+
+    rc = tcp_write_all(fd, msg, len, NULL, 0);
+    free(msg);
+    return rc;
+}
+
+/* Выполняет один разобранный запрос и кладёт JSON ответа в reply_buf.
+ * kind: 1 — это PING (ответ PONG), 2 — это REQUEST. */
+static int run_request(const char *body, size_t body_len, int kind, uint32_t bundle_id,
+                       int fd, int is_dtn)
+{
+    char perr[256];
+
+    if (kind == 1) {
+        buf_t b;
+        json_pong(&b);
+        return stream_write_reply(fd, is_dtn, bundle_id, reply_buf);
+    }
+
+    /* тело крупнее лимита узла — отвечаем отказом, а не молчим:
+     * молчание выглядело бы как потеря пакета и съедало бы таймаут */
+    if ((int)body_len > N.max_body) {
+        scpy(perr, sizeof perr, "задание ");
+        scat_u(perr, sizeof perr, (unsigned long)body_len);
+        scat(perr, sizeof perr, " байт больше лимита узла ");
+        scat_u(perr, sizeof perr, (unsigned long)N.max_body);
+        buf_t b;
+        json_err(&b, perr);
+        return stream_write_reply(fd, is_dtn, bundle_id, reply_buf);
+    }
+
+    size_t len = body_len < sizeof rx_buf - 1 ? body_len : sizeof rx_buf - 1;
+    memcpy(rx_buf, body, len);
+    rx_buf[len] = '\0';
+
+    static req_t req;
+    if (!req_parse(rx_buf, &req)) {
+        buf_t b;
+        json_err(&b, "запрос не JSON или без поля role");
+        return stream_write_reply(fd, is_dtn, bundle_id, reply_buf);
+    }
+
+    N.served++;
+    buf_t res;
+    build_reply(&req, &res);
+    dprint("[%s/%s] %s -> %s\n", req.role[0] ? req.role : "?", N.tag,
+           req.title[0] ? req.title : "?", res.p ? res.p : "");
+    return stream_write_reply(fd, is_dtn, bundle_id, res.p ? res.p : "");
+}
+
+/* Обслуживает одно соединение, пока клиент не закроет его или не замолчит.
+ * Работает и для TCP, и для DTN: различие только в заголовке. */
+static void serve_stream(int fd, int is_dtn)
+{
+    const size_t hdrlen = is_dtn ? (size_t)DC_DTN_HEADER_LEN : (size_t)DC_TCP_HEADER_LEN;
+
+    for (;;) {
+        int n = stream_wait_readable(fd, DC_STREAM_IDLE_MS);
+        if (n <= 0) break;          /* молчит слишком долго или ошибка */
+
+        unsigned char hdr[DC_DTN_HEADER_LEN];
+        char          err[192] = {0};
+        if (tcp_read_all(fd, hdr, hdrlen, err, sizeof err) != 0) break;
+
+        uint32_t body_len = (uint32_t)hdr[6] << 24 | (uint32_t)hdr[7] << 16 |
+                            (uint32_t)hdr[8] << 8 | (uint32_t)hdr[9];
+        if (body_len > (uint32_t)N.max_body) {
+            /* тело всё равно не примем, но клиент уже отправил его в сокет:
+             * закрываем соединение, иначе останется непрочитанный хвост */
+            break;
+        }
+
+        uint32_t bundle_id = is_dtn
+                                 ? ((uint32_t)hdr[10] << 24 | (uint32_t)hdr[11] << 16 |
+                                    (uint32_t)hdr[12] << 8 | (uint32_t)hdr[13])
+                                 : 0;
+
+        unsigned char *body = NULL;
+        if (body_len) {
+            body = (unsigned char *)xmalloc(body_len + 1);
+            if (tcp_read_all(fd, body, body_len, err, sizeof err) != 0) {
+                free(body);
+                break;
+            }
+            body[body_len] = '\0';
+        }
+
+        int kind = hdr[3] == (is_dtn ? DC_DTN_MSG_PING : DC_TCP_MSG_PING) ? 1
+                   : hdr[3] == (is_dtn ? DC_DTN_MSG_REQUEST : DC_TCP_MSG_REQUEST) ? 2
+                                                                         : 0;
+        int rc = kind ? run_request(body ? (char *)body : "", body_len, kind, bundle_id, fd,
+                                    is_dtn)
+                      : 0;
+        free(body);
+        if (rc != 0) break;
+
+        /* DTN: клиент подтверждает приём ответа. Не дожидаться — не беда,
+         * соединение и так закроется, а bundle снимется по таймауту. */
+        if (is_dtn) {
+            if (stream_wait_readable(fd, 5000) > 0) {
+                unsigned char ack[DC_DTN_HEADER_LEN];
+                if (tcp_read_all(fd, ack, DC_DTN_HEADER_LEN, err, sizeof err) != 0) break;
+            }
+        }
+    }
+    close(fd);
+}
+
 /* -------------------------------------------------------- объявление ---- */
 /* Узел объявляет себя постоянно, а не только при старте: планировщик
  * может подняться позже. Пакет 60–80 байт раз в 10 с — примерно ничего.
@@ -1281,11 +1453,12 @@ static const char *prog_name(char **argv)
 
 static void usage(const char *prog)
 {
-    dprint("%s — узел распределённых вычислений (UDP)\n", prog);
+    dprint("%s — узел распределённых вычислений (UDP/TCP/DTN)\n", prog);
     dprint("\n");
     dprint("  %s --role compute [--role verify] [--role memorize] [--role shard] --port N\n",
            prog);
     dprint("      [--tag ИМЯ] [--state DIR] [--max-body Б] [--free-mem Б] [--hello-interval N]\n");
+    dprint("      [--tcp] [--dtn] [--dtn-queue DIR]\n");
     dprint("\n");
     dprint("Один процесс может обслуживать несколько ролей — для устройств,\n");
     dprint("где запуск трёх процессов не помещается в память.\n");
@@ -1298,6 +1471,9 @@ static void usage(const char *prog)
            DC_SHARD_MAX_BYTES);
     dprint("  --hello-interval N  как часто объявлять себя по широковещанию,\n");
     dprint("               секунд (0 = не объявлять; по умолчанию %d)\n", DC_HELLO_SECS);
+    dprint("  --tcp        слушать TCP порт (наряду с UDP)\n");
+    dprint("  --dtn        использовать DTN (store-and-forward) поверх TCP\n");
+    dprint("  --dtn-queue DIR  каталог для очереди DTN (по умолчанию state/dtn)\n");
     dprint("\n");
     dprint("Сборка lite (make lite) — маленькие буферы для SAMD51/RP2040/ESP32.\n");
 }
@@ -1359,6 +1535,20 @@ int main(int argc, char **argv)
         } else if (strcmp(a, "--hello-interval") == 0 && i + 1 < argc) {
             hello_secs = atoi(argv[++i]);
             if (hello_secs <= 0) no_hello = 1;
+#if DC_HAS_STREAMS
+        } else if (strcmp(a, "--tcp") == 0) {
+            N.use_tcp = 1;
+        } else if (strcmp(a, "--dtn") == 0) {
+            N.use_dtn = 1;
+            N.use_tcp = 1;  /* DTN работает поверх TCP */
+        } else if (strcmp(a, "--dtn-queue") == 0 && i + 1 < argc) {
+            scpy(N.dtn_queue, sizeof N.dtn_queue, argv[++i]);
+#else
+        } else if (strcmp(a, "--tcp") == 0 || strcmp(a, "--dtn") == 0 ||
+                   strcmp(a, "--dtn-queue") == 0) {
+            dprint("сборка lite: %s не поддерживается, транспорт только UDP\n", a);
+            return 2;
+#endif
         } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage(prog_name(argv));
             return 0;
@@ -1374,12 +1564,20 @@ int main(int argc, char **argv)
     }
     if (!N.tag[0]) scpy(N.tag, sizeof N.tag, "node");
     if (!N.state_dir[0]) scpy(N.state_dir, sizeof N.state_dir, "state");
+    if (!N.dtn_queue[0]) scpy(N.dtn_queue, sizeof N.dtn_queue, "state/dtn");
     if (N.max_body <= 0) N.max_body = DC_MAX_BODY;
     if (N.free_mem <= 0) N.free_mem = default_free_mem();
     scpy(mpath, sizeof mpath, N.state_dir);
     scat(mpath, sizeof mpath, "/memory.log");
     if (role_allowed(2)) mem_count_init();
     mkdir(N.state_dir, 0775);
+#if DC_HAS_STREAMS
+    if (N.use_dtn) {
+        mkdir(N.dtn_queue, 0775);
+        char derr[256] = {0};
+        dtn_queue_init(N.dtn_queue, derr, sizeof derr);
+    }
+#endif
 
     char err[192] = {0};
     int  fd = udp_socket_bound("0.0.0.0", N.port, err, sizeof err);
@@ -1412,6 +1610,29 @@ int main(int argc, char **argv)
     }
     dprint("\n");
 
+    /* TCP сервер (опционально) */
+    int tcp_fd = -1;
+#if DC_HAS_STREAMS
+    if (N.use_tcp) {
+        char terr[192] = {0};
+        tcp_fd = tcp_socket_server("0.0.0.0", N.port, terr, sizeof terr);
+        if (tcp_fd < 0) dprint("TCP-сервер не запущен: %s\n", terr);
+    }
+#endif
+
+    dprint("%s: порт %d, роли", prog_name(argv), N.port);
+    for (int i = 0; i < N.nroles; i++) dprint(" %s", role_name(N.serve[i]));
+    dprint(", лимит тела %d байт, платформа %s%s", N.max_body, DC_ARCH,
+           no_hello ? ", без объявления" : "");
+    if (N.use_tcp) dprint(", TCP%s", N.use_dtn ? "/DTN" : "");
+    if (role_allowed(3)) {
+        char sdesc[96];
+        shard_describe(sdesc, sizeof sdesc);
+        dprint(", под модель %d байт", (int)N.free_mem);
+        dprint(" (%s)", sdesc);
+    }
+    dprint("\n");
+
     /*
      * Объявления идут из основного цикла через poll(), а не отдельным
      * sleep: иначе узел первые секунды не отвечает на запросы вообще.
@@ -1429,11 +1650,14 @@ int main(int argc, char **argv)
         int wait_ms = (int)(next_hello - now_ms());
         if (wait_ms < 0 || wait_ms > 500) wait_ms = 500;
 
-        struct pollfd pfd[2] = {
+        /* poll: UDP, disco и — в обычной сборке — TCP */
+        struct pollfd pfd[3] = {
             { .fd = fd, .events = POLLIN, .revents = 0 },
             { .fd = disco_fd, .events = POLLIN, .revents = 0 },
+            { .fd = tcp_fd, .events = POLLIN, .revents = 0 },
         };
-        int nready = poll(pfd, disco_fd >= 0 ? 2 : 1, wait_ms);
+        int npfds = 1 + (disco_fd >= 0 ? 1 : 0) + (tcp_fd >= 0 ? 1 : 0);
+        int nready = poll(pfd, npfds, wait_ms);
         if (nready < 0) {
             if (errno == EINTR) continue;
             continue;
@@ -1457,8 +1681,6 @@ int main(int argc, char **argv)
             char    dperr[192] = {0};
             if (dr > 0 && udp_unpack(buf, (size_t)dr, &dm, dperr, sizeof dperr) == 0 &&
                 dm.type == DC_MSG_PING) {
-                /* не чаще раза в секунду: иначе десяток узлов в сети
-                 * размножит объявления на запрос каждого */
                 long now = now_ms();
                 if (now - last_hello_asked >= 1000) {
                     last_hello_asked = now;
@@ -1467,6 +1689,29 @@ int main(int argc, char **argv)
             }
             continue;
         }
+
+        /* TCP: принимаем новое соединение и обслуживаем его */
+#if DC_HAS_STREAMS
+        if (tcp_fd >= 0 && (pfd[2].revents & POLLIN)) {
+            char terr[192] = {0};
+            int  client = tcp_accept(tcp_fd, &from, terr, sizeof terr);
+            if (client >= 0) {
+                if (N.use_dtn) {
+                    char herr[192] = {0};
+                    if (dtn_handshake_accept(client, herr, sizeof herr) != 0) {
+                        dprint("DTN: узел не представился: %s\n", herr);
+                        close(client);
+                    } else {
+                        serve_stream(client, 1);
+                    }
+                } else {
+                    serve_stream(client, 0);
+                }
+            }
+            continue;
+        }
+#endif
+
         if (!(pfd[0].revents & POLLIN)) continue;
 
         flen = sizeof from;

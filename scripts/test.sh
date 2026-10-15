@@ -52,8 +52,6 @@ start_daemons
 
 cat > "$T/distcomp.conf" <<EOF
 [llm]
-api_key      =
-timeout_ms   = 3000
 payload_mode = expr
 
 [role compute]
@@ -75,6 +73,66 @@ outdir      = $T/runs
 EOF
 
 GOAL='посчитать стоимость закупки 1250*3, затем долю (1250*3+480)/7'
+
+# --- разложенная модель ----------------------------------------------------
+# Модель, по которой строится план, лежит не в планировщике: её веса
+# раскладываются по узлам роли shard, а планировщик гоняет между ними
+# активацию. Эти узлы и файл нужны и планированию, и сценариям 18-19.
+#
+# --free-mem у планирования щедрый не потому, что так надо, а потому что у
+# планирования длинный контекст (системный промпт плюс цель), а контекст —
+# это KV-кэш, то есть память. Сценарии 18-19 проверяют разбиение на тесных
+# узлах, где памяти в обрез.
+PL1=$((BASE+80)); PL2=$((BASE+81)); PL3=$((BASE+82)); PL4=$((BASE+83)); PL5=$((BASE+84))
+start_planner_shards() {
+  "$DCD" --role shard --port $PL1 --tag p-in  --free-mem 2000000 --state "$T/state" >"$T/pl1.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --role shard --port $PL2 --tag p-big --free-mem 2000000 --state "$T/state" >"$T/pl2.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --role shard --port $PL3 --tag p-s1  --free-mem 2000000 --state "$T/state" >"$T/pl3.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --role shard --port $PL4 --tag p-s2  --free-mem 2000000 --state "$T/state" >"$T/pl4.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --role shard --port $PL5 --tag p-out --free-mem 2000000 --state "$T/state" >"$T/pl5.log" 2>&1 & PIDS="$PIDS $!"
+  sleep 0.8
+  cat > "$T/plan.conf" <<EOF
+[llm]
+model_file   = $T/model.gguf
+max_new      = 96
+payload_mode = expr
+
+[role compute]
+daemon = 127.0.0.1:$((BASE+1))
+daemon = 127.0.0.1:$((BASE+2))
+
+[role verify]
+daemon = 127.0.0.1:$((BASE+3))
+
+[role memorize]
+daemon = 127.0.0.1:$((BASE+4))
+
+[role shard]
+daemon = 127.0.0.1:$PL1
+daemon = 127.0.0.1:$PL2
+daemon = 127.0.0.1:$PL3
+daemon = 127.0.0.1:$PL4
+daemon = 127.0.0.1:$PL5
+
+[scheduler]
+concurrency = 4
+retries     = 2
+timeout_ms  = 10000
+backoff_ms  = 150
+outdir      = $T/runs
+EOF
+}
+
+# Эталонная мини-модель llama в формате GGUF (RMSNorm, RoPE, GQA, SwiGLU, BPE).
+# Собирается один раз, до первого сценария: она нужна и планированию, и
+# сценариям 18-19. Отчёт о сборке печатает сценарий 18, где про неё и речь.
+MODEL_OK=0
+if command -v python3 >/dev/null 2>&1; then
+  if python3 scripts/llama_ref.py "$T/model.gguf" --json "$T/ref.json" >"$T/gguf.txt" 2>&1; then
+    MODEL_OK=1
+    start_planner_shards
+  fi
+fi
 
 echo
 echo "1. вычислитель выражений"
@@ -184,40 +242,31 @@ else
 fi
 
 echo
-echo "8. планирование через LLM (mock OpenAI)"
-if command -v python3 >/dev/null 2>&1; then
-  python3 scripts/mock_llm.py $((BASE+20)) "$T/llm_request.json" >/dev/null 2>&1 & PIDS="$PIDS $!"
-  sleep 0.6
-  cat > "$T/llm.conf" <<EOF
-[llm]
-url          = http://127.0.0.1:$((BASE+20))/v1/chat/completions
-model        = mock-model
-api_key      = sk-test-123
-timeout_ms   = 5000
-payload_mode = expr
+echo "8. планирование локальной моделью, разложенной по узлам"
+# Модель, которая строит план, не лежит в планировщике: её веса раскладываются
+# по узлам роли shard. Проверяем всю цепочку — раскладку, открытие конвейера
+# и честный отказ, когда промпт в контекст не влезает.
+if [ -f "$T/model.gguf" ]; then
+  OUT=$($DC -c "$T/plan.conf" llm check 2>&1); RC=$?
+  check "llm check: модель на месте"      "$OUT" "архитектура:    llama"
+  check "llm check: раскладка показана"   "$OUT" "Раскладка модели по устройствам"
+  check "llm check: вход на своём узле"   "$OUT" "вход (эмбеддинг)"
+  check "llm check: без ключа и сервера"  "$OUT" "ключи и внешний сервер не нужны"
+  check "llm check: код возврата 0"       "$RC"  "0"
 
-[role compute]
-daemon = 127.0.0.1:$((BASE+1))
-
-[role verify]
-daemon = 127.0.0.1:$((BASE+3))
-
-[role memorize]
-daemon = 127.0.0.1:$((BASE+4))
-
-[scheduler]
-outdir = $T/runs
-EOF
-  OUT=$($DC -c "$T/llm.conf" run "$GOAL" 2>&1)
-  check "markdown-ограждение снято, план принят" "$OUT" "Все шаги выполнены"
-  check "заголовок Authorization"  "$(cat "$T/llm_request.json")" "Bearer sk-test-123"
-  check "запрошен json_object"     "$(cat "$T/llm_request.json")" '"response_format"'
-  check "в промпте есть роли"      "$(cat "$T/llm_request.json")" 'compute'
-  check "в промпте есть адреса"    "$(cat "$T/llm_request.json")" "$((BASE+1))"
-  # модель должна видеть реальный лимит тела узла, а не гадать
-  check "в промпте виден лимит тела" "$(cat "$T/llm_request.json")" "байт задачи"
+  OUT=$($DC -c "$T/plan.conf" -v run "$GOAL" 2>&1); RC=$?
+  check "промпт посчитан по токенизатору" "$OUT" "промпт "
+  check "контекст подобран под промпт"     "$OUT" "нужно контекста"
+  # эталонная модель в тестах крошечная (4 слоя, словарь 256), поэтому на
+  # каждый знак приходится токен и системный промпт в неё не влезает. Важно
+  # тут не «план построен», а что об этом сказано вслух, а не сделано вид,
+  # будто всё в порядке.
+  check "нехватка контекста названа"       "$OUT" "больше"
+  check "подсказка, что делать"            "$OUT" "словарём"
+  check "откат на эвристику назван"        "$OUT" "эвристический планировщик"
+  check "запуск всё равно доведён до конца" "$OUT" "Все шаги выполнены"
 else
-  echo "  пропущено: нет python3"
+  echo "  пропущено: нет эталонной модели (нужен python3)"
 fi
 
 echo
@@ -358,7 +407,7 @@ sleep 0.6
 check "запускается lite-сборка"    "$(cat "$T/lite.log")" "dcd-lite"
 cat > "$T/lite.conf" <<EOF
 [llm]
-api_key =
+
 [role compute]
 daemon = 127.0.0.1:$LITE
 [role memorize]
@@ -405,7 +454,7 @@ SRV=$((BASE+51))
 sleep 0.6
 cat > "$T/mix.conf" <<EOF
 [llm]
-api_key =
+
 [role compute]
 daemon = 127.0.0.1:$SRV
 daemon = 127.0.0.1:$LITE
@@ -438,21 +487,17 @@ BIG_ON_SRV=$(printf '%s' "$OUT" | grep -A0 '"big"' | grep -c ":$SRV " || true)
 check "большой шаг ушёл на сервер"  "$OUT" "4 КБ — только сервер"
 
 echo
-echo "15. LLM вернула негодный план -> модель чинит по нашей подсказке"
-if command -v python3 >/dev/null 2>&1; then
-  python3 scripts/mock_llm.py $((BASE+21)) "$T/repair.json" repair >/dev/null 2>&1 & PIDS="$PIDS $!"
-  sleep 0.6
-  sed "s|:$((BASE+20))|:$((BASE+21))|" "$T/llm.conf" > "$T/repair.conf"
-  OUT=$($DC -c "$T/repair.conf" run "$GOAL" 2>&1); RC=$?
-  check "отказ разъяснён"             "$OUT" "план от LLM отклонён"
-  check "причина названа вслух"       "$OUT" "цикл"
-  check "модель спросили ещё раз"     "$(cat "$T/repair.json")" '"requests": 2'
-  check "в ответе виден прошлый план" "$(cat "$T/repair.json")" "1250*3"
-  check "подсказка ушла модели"       "$(cat "$T/repair.json")" "Верни исправленный план"
-  check "после починки всё выполнено" "$OUT" "Все шаги выполнены"
-  check "код возврата 0"              "$RC"  "0"
+echo "15. --strict: негодный ответ модели не подменяется молча"
+# Пользователь попросил модель — и должен получить отказ, а не тихо
+# выполненный план от эвристики. Проверяем ровно это.
+if [ "$MODEL_OK" = 1 ]; then
+  OUT=$($DC -c "$T/plan.conf" --strict run "$GOAL" 2>&1); RC=$?
+  check "причина отказа названа"      "$OUT" "контекст"
+  check_absent "эвристика не подставлена" "$OUT" "эвристический планировщик"
+  check "код возврата 4"              "$RC"  "4"
+  check_absent "план вслепую не выполнен" "$OUT" "Все шаги выполнены"
 else
-  echo "  пропущено: нет python3"
+  echo "  пропущено: нет эталонной модели (нужен python3)"
 fi
 
 echo
@@ -471,17 +516,21 @@ OUT=$($DC -c "$T/distcomp.conf" discover 1 2>&1)
 check "и повторный поиск находит"   "$OUT" "disc-01"
 
 echo
-echo "17. локальная LLM без ключа (llama.cpp / Ollama / LM Studio)"
-if command -v python3 >/dev/null 2>&1; then
-  python3 scripts/mock_llm.py $((BASE+22)) "$T/local_request.json" >/dev/null 2>&1 & PIDS="$PIDS $!"
-  sleep 0.6
-  cat > "$T/local.conf" <<EOF
+echo "17. планирование не требует ни ключа, ни сервера"
+# Раньше здесь жил внешний LLM-сервер и вопрос «нужен ли ключ». Теперь
+# вопрос снят: ключа не бывает, сервера не бывает — модель лежит в файле,
+# а считают её узлы. Проверяем, что планирование работает в пустой сети.
+if [ "$MODEL_OK" = 1 ]; then
+  OUT=$($DC -c "$T/plan.conf" llm 2>&1); RC=$?
+  check "модель описана"                "$OUT" "модель: $T/model.gguf"
+  check "узлы названы"                   "$OUT" "узлы:   shard"
+  check "про внешний сервер сказано"     "$OUT" "внешний сервер не нужны"
+  check "код возврата 0"                 "$RC"  "0"
+
+  # конфигурация вообще без ключей и адресов — только файл и узлы
+  cat > "$T/nokey.conf" <<EOF
 [llm]
-url          = http://127.0.0.1:$((BASE+22))/v1/chat/completions
-model        = mock-model
-api_key      =
-timeout_ms   = 5000
-payload_mode = expr
+model_file = $T/model.gguf
 
 [role compute]
 daemon = 127.0.0.1:$((BASE+1))
@@ -489,24 +538,20 @@ daemon = 127.0.0.1:$((BASE+1))
 [role verify]
 daemon = 127.0.0.1:$((BASE+3))
 
-[role memorize]
-daemon = 127.0.0.1:$((BASE+4))
+[role shard]
+daemon = 127.0.0.1:$PL1
+daemon = 127.0.0.1:$PL2
+daemon = 127.0.0.1:$PL5
 EOF
-  OUT=$($DC -c "$T/local.conf" llm 2>&1); RC=$?
-  check "сервер найден без ключа"      "$OUT" "не нужен (сервер свой)"
-  check "список моделей получен"       "$OUT" "mock-model"
-  check "код возврата 0"               "$RC"  "0"
-  # и главное: планирование работает вообще без ключа
-  OUT=$($DC -c "$T/local.conf" run "$GOAL" 2>&1); RC=$?
-  check "план построен без ключа"      "$OUT" "Все шаги выполнены"
-  check "ключ не отправлялся"          "$(cat "$T/local_request.json")" '"auth": null'
-  # а для чужого сервера без ключа — внятное объяснение, а не тихий откат
-  sed "s|127.0.0.1:$((BASE+22))|198.51.100.7:9|" "$T/local.conf" > "$T/cloud.conf"
-  OUT=$($DC -c "$T/cloud.conf" --strict llm 2>&1)
-  check "для чужого сервера ключ нужен" "$OUT" "не локальный"
-  check "и сказано, что делать"         "$OUT" "auth = none"
+  OUT=$($DC -c "$T/nokey.conf" --strict llm 2>&1)
+  check "три узла — раскладка возможна"   "$OUT" "Раскладка модели по устройствам"
+  check "готовность подтверждена"        "$OUT" "план можно строить локально"
+  # а если модели нет — это сказано прямо, а не сделано вид
+  OUT=$($DC -c "$T/distcomp.conf" llm 2>&1); RC=$?
+  check "без модели сказано честно"      "$OUT" "не задан model_file"
+  check "и код возврата 3"               "$RC"  "3"
 else
-  echo "  пропущено: нет python3"
+  echo "  пропущено: нет эталонной модели (нужен python3)"
 fi
 
 echo
@@ -520,7 +565,7 @@ SH1=$((BASE+70)); SH2=$((BASE+71)); SH3=$((BASE+72)); SH4=$((BASE+73)); SH5=$((B
 sleep 0.8
 cat > "$T/shard.conf" <<EOF
 [llm]
-api_key =
+
 [role shard]
 daemon = 127.0.0.1:$SH1
 daemon = 127.0.0.1:$SH2
@@ -532,9 +577,8 @@ timeout_ms = 8000
 retries = 0
 EOF
 
-# эталонная мини-модель llama в формате GGUF (RMSNorm, RoPE, GQA, SwiGLU, BPE)
-if command -v python3 >/dev/null 2>&1; then
-  python3 scripts/llama_ref.py "$T/model.gguf" --json "$T/ref.json" >"$T/gguf.txt" 2>&1
+# эталонная модель уже собрана в начале тестов; здесь про неё и отчёт
+if [ "$MODEL_OK" = 1 ]; then
   ok "эталонная модель GGUF собрана ($(head -1 "$T/gguf.txt"))"
 else
   bad "эталонная модель GGUF собрана" "нет python3"
@@ -557,7 +601,7 @@ fi
 # конвейеру нужно минимум три узла: вход, слои и выход — на разных устройствах
 cat > "$T/two.conf" <<EOF
 [llm]
-api_key =
+
 [role shard]
 daemon = 127.0.0.1:$SH1
 daemon = 127.0.0.1:$SH5

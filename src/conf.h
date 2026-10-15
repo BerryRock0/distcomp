@@ -31,22 +31,13 @@ typedef struct {
 } dc_role;
 
 typedef struct {
-    /* [llm] */
-    char  *llm_url;
-    char  *llm_model;
-    char  *llm_key;
-    char  *llm_style;        /* openai | anthropic */
-    char  *llm_auth_header;  /* e.g. x-api-key */
-    char  *llm_extra_header; /* e.g. anthropic-version: 2023-06-01 */
-    char  *llm_json_mode;    /* auto | on | off */
-    /* как обращаться к LLM: auto | none | bearer.
-     * auto — ключ есть, значит шлём; ключа нет, значит сервер локальный или
-     * свой в сети, и авторизация ему не нужна. Именно так работают
-     * llama.cpp server, Ollama и LM Studio, запущенные без ключа. */
-    char  *llm_auth;
-    long   llm_timeout_ms;
-    double llm_temp;
-    char  *payload_mode;     /* expr | free */
+    /* [llm] — модель, которая строит план. Она не внешняя: файл GGUF лежит на
+     * диске, а веса раскладываются по узлам роли shard. Поэтому здесь нет ни
+     * адреса сервера, ни ключа, ни стиля запроса. */
+    char *model_file;    /* путь к GGUF; пусто — план строит эвристика */
+    int   n_ctx;         /* токенов контекста; 0 — 512, потолок 4096 */
+    int   max_new;       /* сколько токенов модель может нагенерировать */
+    char *payload_mode;  /* expr | free */
 
     /* [role <name>] */
     dc_role roles[DC_MAX_ROLES];

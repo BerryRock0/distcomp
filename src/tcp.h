@@ -75,7 +75,8 @@ int tcp_write_all(int fd, const unsigned char *buf, size_t len, char *err, size_
 int tcp_request(int sock, const char *host, int port, unsigned char type,
                 const char *json, long timeout_ms, char **out_body, char *err, size_t errlen);
 
-/* Как tcp_request, но payload — произвольные данные, а не JSON. */
+/* Как tcp_request, но payload — произвольные данные, а не JSON: команды узлу
+ * shard (wt|…, shape|…, gen|…, part|…) не являются JSON-документом. */
 int tcp_request_raw(int sock, const char *host, int port, const char *payload, size_t len,
                     long timeout_ms, char **out_body, char *err, size_t errlen);
 
