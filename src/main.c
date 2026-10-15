@@ -688,21 +688,17 @@ int main(int argc, char **argv)
     }
 
     /* ---------------------------------------------------- llm ------ */
-    /* «dcctl llm» без аргументов — проверка внешнего LLM-сервера. С подкомандой
-     * info/deploy/prompt — распределённая LLM (разложенная по устройствам). */
+    /* «dcctl llm» без подкоманды — проверка локальной модели (то же, о чём
+     * планировщик думает перед постройкой плана). С подкомандой
+     * info/deploy/prompt/check — работа с моделью, разложенной по узлам. */
     if (strcmp(cmd, "llm") == 0) {
-        int is_model = argc - optind > 0 && strncmp(argv[optind], "info", 4) == 0;
-        if (argc - optind > 0 && strncmp(argv[optind], "deploy", 6) == 0) is_model = 1;
-        if (argc - optind > 0 && strncmp(argv[optind], "prompt", 6) == 0) is_model = 1;
-        if (is_model) {
-            int rc = shard_cmd(cfg, argc - optind, argv + optind, err, sizeof err);
-            if (rc != 0 && err[0]) log_error("%s", err);
-            conf_free(cfg);
-            free(goal_buf);
-            return rc;
+        int rc;
+        if (argc - optind > 0) {
+            rc = shard_cmd(cfg, argc - optind, argv + optind, err, sizeof err);
+        } else {
+            rc = llm_check(cfg, err, sizeof err);
         }
-        int rc = llm_check(cfg, err, sizeof err);
-        if (rc != 0) log_error("%s", err);
+        if (rc != 0 && err[0]) log_error("%s", err);
         conf_free(cfg);
         free(goal_buf);
         return rc;

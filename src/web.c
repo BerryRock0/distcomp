@@ -128,6 +128,11 @@ static void http_reply(int fd, int status, const char *ctype, const char *body, 
     size_t off = 0;
     while (off < len) {
         ssize_t w = write(fd, body + off, len - off);
+        /* Прерывание по сигналу — это не отказ: write не перезапрашивает
+         * себя сам, и если на этом разорвать, клиент получит обрезанный ответ.
+         * В частности отваливался элемент в конце страницы панели: заголовок
+         * успевал уйти, хвост — нет. */
+        if (w < 0 && errno == EINTR) continue;
         if (w <= 0) break;
         off += (size_t)w;
     }
@@ -172,10 +177,12 @@ static void caps_copy_back(dc_config *dst, const dc_config *src)
     }
 }
 
+/* «настроена» = локальная модель разложилась по узлам роли shard и планы
+ * можно строить без внешнего сервера */
 static int llm_available_for_web(const dc_config *cfg)
 {
-    if (!cfg->llm_url || !*cfg->llm_url || !cfg->llm_model || !*cfg->llm_model) return 0;
-    return !llm_needs_key(cfg);
+    llm_status st;
+    return llm_local_status(cfg, &st);
 }
 
 /* ------------------------------------------------------- состояние ---- */
@@ -449,14 +456,11 @@ static void api_state(dc_web *w, int fd)
     }
     sb_add(&b, "],\"settings\":{");
     sb_printf(&b, "\"llm_model\":");
-    sb_add_json_string(&b, w->cfg->llm_model);
-    /* «настроена» = к LLM можно обратиться: ключ есть, либо сервер локальный
-     * и ключ ему не нужен. Иначе панель врёт про локальный сервер без ключа */
+    sb_add_json_string(&b, w->cfg->model_file);
+    /* «настроена» = модель разложилась по узлам, а не просто файл существует:
+     * иначе панель врала бы о парке, который модель не вмещает */
     sb_printf(&b, ",\"llm_configured\":%s", llm_available_for_web(w->cfg) ? "true" : "false");
-    sb_add(&b, ",\"llm_url\":");
-    sb_add_json_string(&b, w->cfg->llm_url);
-    sb_add(&b, ",\"llm_needs_key\":");
-    sb_add(&b, llm_needs_key(w->cfg) ? "true" : "false");
+    sb_printf(&b, ",\"llm_n_ctx\":%d", w->cfg->n_ctx);
     sb_printf(&b, ",\"payload_mode\":");
     sb_add_json_string(&b, w->cfg->payload_mode);
     sb_printf(&b, ",\"concurrency\":%d,\"retries\":%d,\"timeout_ms\":%ld",
@@ -663,8 +667,9 @@ static void api_role(dc_web *w, int fd, const char *body)
     conf_free(live);
 }
 
-/* Проверка LLM по кнопке в панели: отвечает тот же llm_check, что и CLI,
- * но его вывод идёт в ответ, а не в терминал панели. */
+/* Проверка локальной модели по кнопке в панели: модель разложена по узлам?
+ * Отвечает тот же llm_local_status, что и CLI, но его вывод идёт в ответ,
+ * а не в терминал панели. */
 static void api_llm(dc_web *w, int fd)
 {
     dc_config *cfg = NULL;
@@ -672,33 +677,27 @@ static void api_llm(dc_web *w, int fd)
     cfg = conf_clone(w->cfg);
     pthread_mutex_unlock(&w->mu);
 
-    strbuf b;
+    strbuf     b;
     sb_init(&b);
-    char err[512] = {0};
-    int  rc = cfg ? llm_check_quiet(cfg, err, sizeof err) : 3;
+    llm_status st;
+    memset(&st, 0, sizeof st);
+    int ready = cfg ? llm_local_status(cfg, &st) : 0;
 
     sb_add(&b, "{\"ok\":");
-    sb_add(&b, rc == 0 ? "true" : "false");
+    sb_add(&b, ready ? "true" : "false");
     sb_add(&b, ",\"error\":");
-    sb_add_json_string(&b, rc == 0 ? "" : err);
-    sb_add(&b, ",\"url\":");
-    sb_add_json_string(&b, cfg && cfg->llm_url ? cfg->llm_url : "");
+    sb_add_json_string(&b, ready ? "" : st.note);
     sb_add(&b, ",\"model\":");
-    sb_add_json_string(&b, cfg && cfg->llm_model ? cfg->llm_model : "");
-    sb_add(&b, ",\"models\":[");
-    if (rc == 0 && cfg) {
-        char **ids = NULL;
-        int    n = llm_list_models(cfg, &ids, err, sizeof err);
-        for (int i = 0; i < n; i++) {
-            if (i) sb_add(&b, ",");
-            sb_add_json_string(&b, ids[i]);
-            free(ids[i]);
-        }
-        free(ids);
-    }
-    sb_add(&b, "]}");
+    sb_add_json_string(&b, st.model);
+    sb_add(&b, ",\"arch\":");
+    sb_add_json_string(&b, st.arch);
+    sb_printf(&b, ",\"n_layer\":%d,\"n_embd\":%d,\"n_vocab\":%d", st.n_layer, st.n_embd,
+              st.n_vocab);
+    sb_printf(&b, ",\"n_ctx\":%d,\"n_nodes\":%d,\"n_stages\":%d", st.n_ctx, st.n_nodes,
+              st.n_stages);
+    sb_printf(&b, ",\"bytes\":%zu}", st.bytes);
     conf_free(cfg);
-    reply_json(fd, rc == 0 ? 200 : 503, &b);
+    reply_json(fd, ready ? 200 : 503, &b);
     sb_free(&b);
 }
 

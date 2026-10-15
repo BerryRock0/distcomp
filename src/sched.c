@@ -2,6 +2,7 @@
 #include "json.h"
 #include "tty.h"
 #include "udp.h"
+#include "xport.h"
 #include "util.h"
 
 #include <pthread.h>
@@ -40,7 +41,7 @@ static void lock(runner *r)   { pthread_mutex_lock(&r->mu); }
 static void unlock(runner *r) { pthread_mutex_unlock(&r->mu); }
 
 /* Определена ниже, вместе с остальной проверкой узлов. */
-static int node_probe(const char *host, int port, int *ms_out, dc_capability *cap,
+static int node_probe(dc_endpoint *ep, int *ms_out, dc_capability *cap,
                       char *err, size_t errlen);
 
 /* Опрос всех узлов сразу, параллельно: последовательный обход добавил бы
@@ -53,16 +54,13 @@ typedef struct {
 
 static void *probe_one(void *arg)
 {
-    probe_arg *a = arg;
-    dc_role   *r = &a->cfg->roles[a->role_idx];
+    probe_arg   *a = arg;
+    dc_role     *r = &a->cfg->roles[a->role_idx];
     dc_endpoint *e = &r->eps[a->ep_idx];
 
-    char host[320];
-    int  port = 0;
-    char err[256] = {0};
-    if (udp_parse_endpoint(e->url, host, sizeof host, &port, err, sizeof err) != 0) return NULL;
-    int ms = 0;
-    node_probe(host, port, &ms, &e->cap, err, sizeof err);
+    char err[512] = {0};
+    int  ms = 0;
+    node_probe(e, &ms, &e->cap, err, sizeof err);
     return NULL;
 }
 
@@ -171,37 +169,19 @@ static void *worker(void *arg)
     sb_init(&body);
     build_request_body(j->p, j->step, j, &body);
 
-    char host[320];
-    int  port = 0;
-    char herr[512] = {0};
-    if (udp_parse_endpoint(j->ep->url, host, sizeof host, &port, herr, sizeof herr) != 0) {
-        j->ms = 0;
-        j->ok = 0;
-        j->error = xstrdup(herr);
-        sb_free(&body);
-        return NULL;
-    }
-
-    /* отдельный сокет на задачу: запрос-ответ не пересекается с другими,
-     * поэтому отсечение по адресу отправителя работает однозначно */
-    int sock = udp_socket_client(herr, sizeof herr);
-    if (sock < 0) {
-        j->ms = 0;
-        j->ok = 0;
-        j->error = xstrdup(herr);
-        sb_free(&body);
-        return NULL;
-    }
-
+    char  herr[512] = {0};
     char *resp = NULL;
-    long  t0 = now_ms();
-    int   rc = udp_request(sock, host, port, DC_MSG_REQUEST, body.p, j->cfg->timeout_ms, &resp,
-                           herr, sizeof herr);
+
+    long t0 = now_ms();
+    /* Транспорт выбирается по схеме адреса узла (udp://host:port, tcp://,
+     * dtn://) внутри xport — здесь об этом думать не нужно. */
+    int rc = xport_request(j->ep, DC_MSG_REQUEST, body.p, j->cfg->timeout_ms, &resp, herr,
+                           sizeof herr);
     j->ms = now_ms() - t0;
-    close(sock);
     sb_free(&body);
 
     if (rc != 0) {
+        j->ms = 0;
         j->ok = 0;
         j->error = xstrdup(herr);
         return NULL;
@@ -573,22 +553,19 @@ void sched_print_plan(const plan *p, const dc_config *cfg)
  * Один PING, из которого получаем и задержку, и возможности узла.
  * Раньше здесь было два обмена: сначала ping ради задержки, потом второй
  * ради PONG — лишний круг на каждый узел при каждой проверке.
+ *
+ * Транспорт определяется по схеме адреса узла: udp://, tcp://, dtn://.
  */
-static int node_probe(const char *host, int port, int *ms_out, dc_capability *cap,
+static int node_probe(dc_endpoint *ep, int *ms_out, dc_capability *cap,
                       char *err, size_t errlen)
 {
-    char  perr[256] = {0};
-    int   s = udp_socket_client(perr, sizeof perr);
-    if (s < 0) {
-        snprintf(err, errlen, "%s", perr);
-        return -1;
-    }
+    char  perr[512] = {0};
     char *pong = NULL;
-    long  t0 = now_ms();
-    int   rc = udp_request(s, host, port, DC_MSG_PING, "{\"role\":\"ping\"}", 3000, &pong,
-                           perr, sizeof perr);
+
+    long t0 = now_ms();
+    int  rc = xport_request(ep, DC_MSG_PING, "{\"role\":\"ping\"}", 3000, &pong, perr, sizeof perr);
     if (ms_out) *ms_out = (int)(now_ms() - t0);
-    close(s);
+
     if (rc != 0) {
         snprintf(err, errlen, "%s", perr);
         return -1;
@@ -653,7 +630,7 @@ int sched_probe(dc_config *cfg, dc_node_status *out, int max)
             char host[320];
             int  port = 0;
             char err[256] = {0};
-            if (udp_parse_endpoint(r->eps[j].url, host, sizeof host, &port, err, sizeof err) != 0) {
+            if (xport_parse(r->eps[j].url, host, sizeof host, &port, err, sizeof err) != 0) {
                 ns->alive = 0;
                 snprintf(ns->detail, sizeof ns->detail, "%s", err);
                 continue;
@@ -669,7 +646,7 @@ int sched_probe(dc_config *cfg, dc_node_status *out, int max)
             }
 
             int ms = 0;
-            if (node_probe(host, port, &ms, &r->eps[j].cap, err, sizeof err) != 0) {
+            if (node_probe(&r->eps[j], &ms, &r->eps[j].cap, err, sizeof err) != 0) {
                 ns->alive = 0;
                 snprintf(ns->detail, sizeof ns->detail, "%s", err);
                 continue;
@@ -702,7 +679,7 @@ int sched_check(dc_config *cfg)
             char host[320];
             int  port = 0;
             char err[256] = {0};
-            if (udp_parse_endpoint(r->eps[j].url, host, sizeof host, &port, err, sizeof err) != 0) {
+            if (xport_parse(r->eps[j].url, host, sizeof host, &port, err, sizeof err) != 0) {
                 printf("    %s:%d", host, port);
                 printf("  некорректный адрес: %s\n", err);
                 bad++;
@@ -712,15 +689,15 @@ int sched_check(dc_config *cfg)
             dc_capability cap;
             memset(&cap, 0, sizeof cap);
             int ms = 0;
-            if (node_probe(host, port, &ms, &cap, err, sizeof err) != 0) {
-                printf("    %s:%d", host, port);
+            if (node_probe(&r->eps[j], &ms, &cap, err, sizeof err) != 0) {
+                printf("    %s", r->eps[j].url);
                 printf("  недоступен: %s\n", err);
                 bad++;
                 continue;
             }
             /* показываем, что за устройство перед нами и на что оно способно */
-            printf("    %s:%d", host, port);
-            printf("  живой, %3d мс", ms);
+            printf("    %s  ", r->eps[j].url);
+            printf("живой, %3d мс", ms);
             if (cap.known) printf(", лимит тела %d байт", cap.max_body);
             if (cap.free_mem > 0) printf(", под модель %ld байт", cap.free_mem);
             if (cap.shard[0] && strncmp(cap.shard, "пусто", 5) != 0) printf(" [%s]", cap.shard);
