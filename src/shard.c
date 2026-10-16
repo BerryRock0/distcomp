@@ -8,6 +8,7 @@
 #include "util.h"
 #include "xport.h"
 
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -53,6 +54,11 @@
  * поэтому этого хватает и на медленной плате. */
 #define DC_PIPE_TIMEOUT_MS 20000
 
+/* Сколько раз повторять запрос, прежде чем признать узел недоступным.
+ * Раздача модели — это тысячи запросов подряд, и UDP их часть теряет;
+ * три попытки подряд на одной потерянной дейтаграмме — обычное дело. */
+#define DC_PIPE_ATTEMPTS 4
+
 typedef struct {
     unsigned char *raw;
     size_t         size;
@@ -79,7 +85,7 @@ static int llm_open_file(llm_model *m, const char *path, int n_ctx_want,
 {
     memset(m, 0, sizeof *m);
     FILE *f = fopen(path, "rb");
-    if (!f) { snprintf(err, errlen, "не удалось открыть %s", path); return -1; }
+    if (!f) { snprintf(err, errlen, "не удалось открыть %s: %s", path, strerror(errno)); return -1; }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -110,6 +116,9 @@ static int llm_open_file(llm_model *m, const char *path, int n_ctx_want,
         return -1;
     }
 
+    /* Квантованные веса движок теперь считает: gguf_dequant разворачивает
+     * блоки Q2_K..Q8_K и старые кванты в float перед умножением, поэтому
+     * отказывать модели тут больше не из-за чего. */
     unsigned long v;
     if (gguf_u32(&m->g, &v, "block_count", m->arch) == 0) m->n_layer = (int)v;
     if (gguf_u32(&m->g, &v, "embedding_length", m->arch) == 0) m->n_embd = (int)v;
@@ -154,7 +163,8 @@ typedef struct {
 } stage_tensor;
 
 static int stage_tensors(const llm_model *m, int stage, int first, int last,
-                        stage_tensor *out, int max, size_t *total_bytes)
+                        stage_tensor *out, int max, size_t *total_bytes,
+                         char *eout, size_t eoutlen)
 {
     *total_bytes = 0;
     int n = 0;
@@ -165,14 +175,46 @@ static int stage_tensors(const llm_model *m, int stage, int first, int last,
         const gguf_tensor *t = gguf_tensor_find(&m->g, nn);                \
         if (!t) {                                                          \
             snprintf(err_tmp, sizeof err_tmp, "в модели нет тензор %s", nn); \
+            if (eout) snprintf(eout, eoutlen, "%s", err_tmp);                \
             return -1;                                                     \
         }                                                                  \
-        if (n >= max) return -1;                                           \
-        snprintf(out[n].name, sizeof out[n].name, "%s", nn);               \
-        out[n].nbytes = t->nbytes;                                         \
-        out[n].t = t;                                                      \
+        /* out == NULL — считаем только вес стадии. Имена не нужны, и тогда \
+         * количество тензоров не ограничено буфером: у 28 слоёв Qwen2 их \
+         * 28x9 = 252, и раньше стадия слоёв молча возвращала -1. */       \
+        if (out) {                                                         \
+            if (n >= max) {                                                 \
+                if (eout) snprintf(eout, eoutlen,                        \
+                                   "стадия не влезает в список: нужно больше %d тензоров", \
+                                   max);                                   \
+                return -1;                                                 \
+            }                                                               \
+            snprintf(out[n].name, sizeof out[n].name, "%s", nn);           \
+            out[n].nbytes = t->nbytes;                                     \
+            out[n].t = t;                                                  \
+        }                                                                  \
         *total_bytes += t->nbytes;                                         \
         n++;                                                               \
+    } while (0)
+
+/* Как ADD, но отсутствие тензора не ошибка: так добавляются смещения,
+ * которых нет у моделей без них. */
+#define ADD_OPT(nn)                                                           \
+    do {                                                                      \
+        const gguf_tensor *t = gguf_tensor_find(&m->g, nn);                   \
+        if (!t) break;                                                        \
+        if (out) {                                                            \
+            if (n >= max) {                                                    \
+                if (eout) snprintf(eout, eoutlen,                              \
+                                   "стадия не влезает в список: нужно больше %d тензоров", \
+                                   max);                                       \
+                return -1;                                                     \
+            }                                                                  \
+            snprintf(out[n].name, sizeof out[n].name, "%s", nn);              \
+            out[n].nbytes = t->nbytes;                                         \
+            out[n].t = t;                                                      \
+        }                                                                      \
+        *total_bytes += t->nbytes;                                             \
+        n++;                                                                   \
     } while (0)
 
     char err_tmp[128];
@@ -192,24 +234,38 @@ static int stage_tensors(const llm_model *m, int stage, int first, int last,
     } else {
         const char *sfx[] = { "attn_norm.weight", "attn_q.weight", "attn_k.weight",
                               "attn_v.weight", "attn_output.weight", "ffn_norm.weight",
-                              "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
+                              "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+                              /* смещения есть не у всех моделей: у Qwen2 у Q, K и V
+                               * они есть, и без них слой считается неверно */
+                              "attn_q.bias", "attn_k.bias", "attn_v.bias" };
+        /* веса обязательны, смещения — нет: ADD_OPT их пропускает */
         for (int i = first; i <= last; i++) {
-            for (size_t k = 0; k < sizeof sfx / sizeof sfx[0]; k++) {
+            for (size_t k = 0; k < 9; k++) {
                 snprintf(nm, sizeof nm, "blk.%d.%s", i, sfx[k]);
                 ADD(nm);
+            }
+            for (size_t k = 9; k < sizeof sfx / sizeof sfx[0]; k++) {
+                snprintf(nm, sizeof nm, "blk.%d.%s", i, sfx[k]);
+                ADD_OPT(nm);
             }
         }
     }
     return n;
 #undef ADD
+#undef ADD_OPT
 }
 
 /* Ограничение на кусок данных: base64 распухает в 4/3, плюс заголовок
- * команды и запас на ответ. */
+ * команды и запас на ответ.
+ *
+ * Запас в 1/32 оставлен не просто так: дейтаграмма впритык к
+ * DC_UDP_MAX_DGRAM (заголовок UDP + JSON-обвязка) терялась по дороге, и
+ * раздача вставала намертво посередине тензора. */
 static long chunk_budget(const dc_endpoint *ep)
 {
     long body = ep->cap.max_body > 96 ? ep->cap.max_body - 96 : 192;
     long raw = body * 3 / 4;
+    raw -= raw / 32;
     return raw < 3 ? 3 : raw;
 }
 
@@ -260,10 +316,9 @@ static int collect_nodes(dc_config *cfg, llm_node *out, int max, char *err, size
 /* Сколько байт памяти узла требует стадия: веса плюс арена под активации. */
 static long stage_cost(const llm_model *m, int stage, int first, int last)
 {
-    stage_tensor st[128];
     size_t total = 0;
-    char err[128];
-    int n = stage_tensors(m, stage, first, last, st, 128, &total);
+    /* out = NULL: нужны только байты, без списка тензоров */
+    int n = stage_tensors(m, stage, first, last, NULL, 0, &total, NULL, 0);
     if (n < 0) return -1;
     /* арена: рабочие буферы и KV-кэш; считаем через тот же код, что у узла */
     size_t floats = llm_ctx_floats(&m->g, stage, first, last, m->n_ctx);
@@ -450,8 +505,17 @@ static int pipe_send(dc_endpoint *ep, const char *payload, char **out_body,
     sb_add_json_string(&b, payload);
     sb_add(&b, "}");
 
+    /* При раздаче модели уходит около шестнадцати тысяч запросов подряд, и
+     * UDP на загруженной машине теряет часть дейтаграмм. Без повтора одна
+     * потерянная прерывала всю раздачу таймаутом в двадцать секунд. */
     char *resp = NULL;
-    int   rc   = xport_request_raw(ep, b.p, strlen(b.p), DC_PIPE_TIMEOUT_MS, &resp, err, errlen);
+    int   rc   = -1;
+    for (int attempt = 0; attempt < DC_PIPE_ATTEMPTS; attempt++) {
+        if (resp) { free(resp); resp = NULL; }
+        rc = xport_request_raw(ep, b.p, strlen(b.p), DC_PIPE_TIMEOUT_MS, &resp, err, errlen);
+        if (rc == 0) break;
+        log_info("повтор %d: узел %s не ответил (%s)", attempt + 1, ep->url, err);
+    }
     sb_free(&b);
     if (rc != 0) return -1;
 
@@ -477,55 +541,74 @@ static int pipe_send(dc_endpoint *ep, const char *payload, char **out_body,
     return 0;
 }
 
-/* Заливает стадию на узел: тензорами, потом shape. */
-static int pipe_deploy_stage(pipeline *P, int s)
+/* Отправляет один тензор на узел, дробями по вместимости одного сообщения. */
+static int pipe_send_tensor(const llm_node *nd, const stage_tensor *tp, char *err,
+                            size_t errlen)
+{
+    long budget = chunk_budget(nd->ep);
+    long off = 0;
+    while (off < (long)tp->nbytes) {
+        long take = (long)tp->nbytes - off;
+        if (take > budget) take = budget;
+        long chunk = take / 3 * 3;
+        if (chunk <= 0) chunk = take;
+
+        strbuf b;
+        sb_init(&b);
+        sb_printf(&b, "wt|%s|%u|", tp->name, tp->t->n_dims);
+        for (unsigned d = 0; d < tp->t->n_dims; d++)
+            sb_printf(&b, "%s%lu", d ? "," : "", tp->t->dims[d]);
+        sb_printf(&b, "|%u|%ld|%ld|", tp->t->type, off, (long)tp->t->nbytes);
+        char *b64 = xmalloc(b64_encode_size((size_t)chunk) + 1);
+        b64_encode(tp->t->data + off, (size_t)chunk, b64, b64_encode_size((size_t)chunk) + 1);
+        sb_add(&b, b64);
+        free(b64);
+
+        char *out = NULL;
+        int   rc  = pipe_send(nd->ep, b.p, &out, err, errlen);
+        free(out);
+        sb_free(&b);
+        if (rc != 0) {
+            /* сообщение узла лежит в err — переносим его в отдельный буфер,
+             * иначе snprintf писал бы в перекрывающийся сам с собой аргумент */
+            char why[256] = {0};
+            snprintf(why, sizeof why, "%s", err);
+            snprintf(err, errlen, "тензор %s не ушёл на %s: %s", tp->name, nd->ep->url, why);
+            return -1;
+        }
+        off += chunk;
+    }
+    return 0;
+}
+
+/* Заливает стадию на узел: тензорами, потом shape.
+ * err берётся у вызывающего: раньше ошибка писалась в локальный буфер и
+ * доходила до пользователя пустой строкой («раздать нечего: »). */
+static int pipe_deploy_stage(pipeline *P, int s, char *err, size_t errlen)
 {
     llm_model *m = (llm_model *)P->m;
     const llm_node *nd = &P->nodes[P->owner[s]];
-    stage_tensor st[128];
     size_t total;
-    char err[512];
-    int n = stage_tensors(m, nd->stage, nd->first, nd->last, st, 128, &total);
-    if (n < 0) return -1;
 
     /* сначала освобождаем узел: вторая модель не влезет поверх первой */
-    char *out = NULL;
-    if (pipe_send(nd->ep, "free", &out, err, sizeof err) != 0) {
-        fprintf(stderr, "узел %s не освободился: %s\n", nd->ep->url, err);
-        return -1;
-    }
-    free(out);
-
-    for (int i = 0; i < n; i++) {
-        long budget = chunk_budget(nd->ep);
-        long off = 0;
-        while (off < (long)st[i].nbytes) {
-            long take = (long)st[i].nbytes - off;
-            if (take > budget) take = budget;
-            long chunk = take / 3 * 3;
-            if (chunk <= 0) chunk = take;
-
-            strbuf b;
-            sb_init(&b);
-            sb_printf(&b, "wt|%s|%u|", st[i].name, st[i].t->n_dims);
-            for (unsigned d = 0; d < st[i].t->n_dims; d++)
-                sb_printf(&b, "%s%lu", d ? "," : "", st[i].t->dims[d]);
-            sb_printf(&b, "|%u|%ld|%ld|", st[i].t->type, off, (long)st[i].t->nbytes);
-            char *b64 = xmalloc(b64_encode_size((size_t)chunk) + 1);
-            b64_encode(st[i].t->data + off, (size_t)chunk, b64, b64_encode_size((size_t)chunk) + 1);
-            sb_add(&b, b64);
-            free(b64);
-
-            out = NULL;
-            if (pipe_send(nd->ep, b.p, &out, err, sizeof err) != 0) {
-                fprintf(stderr, "тензор %s не ушёл на %s: %s\n", st[i].name, nd->ep->url, err);
-                sb_free(&b);
-                return -1;
-            }
-            free(out);
-            sb_free(&b);
-            off += chunk;
+    {
+        char *out = NULL;
+        if (pipe_send(nd->ep, "free", &out, err, errlen) != 0) {
+            fprintf(stderr, "узел %s не освободился: %s\n", nd->ep->url, err);
+            return -1;
         }
+        free(out);
+    }
+
+    /* Идём по слоям, а не по всей стадии сразу: у 28 слоёв Qwen2 в стадии
+     * слоёв 252 тензора, и список имён в один буфер не помещался. На слой
+     * приходится девять записей — это помещается всегда. */
+    stage_tensor st[16];
+    for (int layer = nd->first; layer <= nd->last; layer++) {
+        int n = stage_tensors(m, nd->stage, layer, layer, st, 16, &total, err, errlen);
+        if (n < 0) return -1;
+        for (int i = 0; i < n; i++)
+            if (pipe_send_tensor(nd, &st[i], err, errlen) != 0) return -1;
     }
 
     /* shape: геометрия и стадия */
@@ -535,8 +618,8 @@ static int pipe_deploy_stage(pipeline *P, int s)
               nd->stage, nd->first, nd->last, m->n_embd, m->n_head, m->n_head_kv, m->n_ff,
               m->head_dim, m->n_vocab, m->n_layer, (double)m->rms_eps, (double)m->rope_base,
               m->n_ctx);
-    out = NULL;
-    if (pipe_send(nd->ep, b.p, &out, err, sizeof err) != 0) {
+    char *out = NULL;
+    if (pipe_send(nd->ep, b.p, &out, err, errlen) != 0) {
         fprintf(stderr, "shape не ушёл на %s: %s\n", nd->ep->url, err);
         sb_free(&b);
         return -1;
@@ -701,7 +784,7 @@ int dc_infer_open(dc_config *cfg, const char *model_path, const dc_infer_opts *o
     pipeline P = { .m = &in->m, .nodes = in->nodes, .owner = in->owner,
                    .nstages = in->nstages, .n_embd = in->m.n_embd, .state = in->state };
     for (int s = 0; s < in->nstages; s++) {
-        if (pipe_deploy_stage(&P, s) != 0) {
+        if (pipe_deploy_stage(&P, s, err, errlen) != 0) {
             infer_release(in);
             return -1;
         }
@@ -851,7 +934,7 @@ int llm_model_tokens(const char *model_path, const char *text, int *out,
      * «секунда» и «вечность». */
     FILE *f = fopen(model_path, "rb");
     if (!f) {
-        snprintf(err, errlen, "не удалось открыть %s", model_path);
+        snprintf(err, errlen, "не удалось открыть %s: %s", model_path, strerror(errno));
         return -1;
     }
     fseek(f, 0, SEEK_END);

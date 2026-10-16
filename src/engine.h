@@ -30,9 +30,17 @@ typedef struct {
     const gguf_tensor *t;
 } llm_w;
 
+/* Смещения. У Qwen2 у проекций Q, K и V они есть (в llama их нет), и без
+ * них Q и K считаются неверно — внимание уезжает и модель выдаёт мусор.
+ * Поле пустое у моделей без смещений, тогда шаг пропускается. */
+typedef struct {
+    const gguf_tensor *q, *k, *v;
+} llm_bias;
+
 typedef struct {
     llm_w attn_norm, attn_q, attn_k, attn_v, attn_out;
     llm_w ffn_norm, ffn_gate, ffn_up, ffn_down;
+    llm_bias bias;
 } llm_layer;
 
 typedef struct {
@@ -53,6 +61,7 @@ typedef struct {
     float *wn, *xs;               /* [n_embd] веса норм, [max(n_ff,n_embd)] черновик */
     float *q, *att;               /* [n_head*head_dim] ×2 */
     float *k, *v;                 /* [n_kv*head_dim] ×2 */
+    float *bqq, *bkq, *bvq;       /* развёрнутые смещения Q/K/V, [n_head*hd] и [n_kv*hd] */
     float *qh;                     /* [head_dim] — одна голова после RoPE */
     float *scores;                 /* [n_ctx] — очки внимания до softmax */
     float *logits;                 /* [n_vocab], только для HEAD */

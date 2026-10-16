@@ -42,7 +42,7 @@ static void unlock(runner *r) { pthread_mutex_unlock(&r->mu); }
 
 /* Определена ниже, вместе с остальной проверкой узлов. */
 static int node_probe(dc_endpoint *ep, int *ms_out, dc_capability *cap,
-                      char *err, size_t errlen);
+                       char *err, size_t errlen);
 
 /* Опрос всех узлов сразу, параллельно: последовательный обход добавил бы
  * N·RTT к началу каждого запуска, что заметно на медленной сети. */
@@ -562,8 +562,22 @@ static int node_probe(dc_endpoint *ep, int *ms_out, dc_capability *cap,
     char  perr[512] = {0};
     char *pong = NULL;
 
+    /* Если у узла есть параметры в конфигурации — добавляем их в PING,
+     * чтобы узел мог применить их (например, max_body или hello_interval) */
+    char ping_json[512];
+    if (ep && (ep->params.max_body > 0 || ep->params.hello_secs > 0 ||
+               ep->params.use_tcp || ep->params.use_dtn)) {
+        snprintf(ping_json, sizeof ping_json,
+                 "{\"role\":\"ping\",\"cfg_max_body\":%d,\"cfg_free_mem\":%ld,"
+                 "\"cfg_hello_secs\":%d,\"cfg_use_tcp\":%d,\"cfg_use_dtn\":%d}",
+                 ep->params.max_body, ep->params.free_mem,
+                 ep->params.hello_secs, ep->params.use_tcp, ep->params.use_dtn);
+    } else {
+        snprintf(ping_json, sizeof ping_json, "{\"role\":\"ping\"}");
+    }
+
     long t0 = now_ms();
-    int  rc = xport_request(ep, DC_MSG_PING, "{\"role\":\"ping\"}", 3000, &pong, perr, sizeof perr);
+    int  rc = xport_request(ep, DC_MSG_PING, ping_json, 3000, &pong, perr, sizeof perr);
     if (ms_out) *ms_out = (int)(now_ms() - t0);
 
     if (rc != 0) {

@@ -44,7 +44,7 @@ static char *expand_value(const char *val)
 dc_config *conf_new(void)
 {
     dc_config *cfg = xcalloc(1, sizeof *cfg);
-    /* Модели по умолчанию нет: без неё план строится эвристикой, и об этом
+    /* Модели по умолчанию нет: без неё план строется эвристикой, и об этом
      * честно говорит llm check, а не молчаливый откат. */
     cfg->model_file   = xstrdup("");
     cfg->n_ctx        = 0;      /* 0 — движок подставит разумное значение */
@@ -55,6 +55,8 @@ dc_config *conf_new(void)
     cfg->timeout_ms   = 60000;
     cfg->backoff_ms   = 500;
     cfg->outdir       = xstrdup("runs");
+    /* Параметры демона по умолчанию (как в dcd) */
+    cfg->node_params.hello_secs = 10;  /* DC_HELLO_SECS */
     return cfg;
 }
 
@@ -64,9 +66,17 @@ void conf_free(dc_config *cfg)
     free(cfg->model_file);
     free(cfg->payload_mode);
     free(cfg->outdir);
+    free(cfg->node_params.tag);
+    free(cfg->node_params.state_dir);
+    free(cfg->node_params.dtn_queue);
     for (int i = 0; i < cfg->nroles; i++) {
         free(cfg->roles[i].name);
-        for (int j = 0; j < cfg->roles[i].nep; j++) free(cfg->roles[i].eps[j].url);
+        for (int j = 0; j < cfg->roles[i].nep; j++) {
+            free(cfg->roles[i].eps[j].url);
+            free(cfg->roles[i].eps[j].params.tag);
+            free(cfg->roles[i].eps[j].params.state_dir);
+            free(cfg->roles[i].eps[j].params.dtn_queue);
+        }
     }
     free(cfg);
 }
@@ -116,6 +126,17 @@ dc_config *conf_clone(const dc_config *src)
     d->timeout_ms   = src->timeout_ms;
     d->backoff_ms   = src->backoff_ms;
 
+    /* Копируем глобальные параметры демона */
+    set_str(&d->node_params.tag, src->node_params.tag);
+    set_str(&d->node_params.state_dir, src->node_params.state_dir);
+    set_str(&d->node_params.dtn_queue, src->node_params.dtn_queue);
+    d->node_params.max_body   = src->node_params.max_body;
+    d->node_params.pool_bytes = src->node_params.pool_bytes;
+    d->node_params.free_mem   = src->node_params.free_mem;
+    d->node_params.hello_secs = src->node_params.hello_secs;
+    d->node_params.use_tcp    = src->node_params.use_tcp;
+    d->node_params.use_dtn    = src->node_params.use_dtn;
+
     d->nroles = 0;
     for (int i = 0; i < src->nroles && d->nroles < DC_MAX_ROLES; i++) {
         dc_role *r = conf_role(d, src->roles[i].name, 1);
@@ -124,6 +145,16 @@ dc_config *conf_clone(const dc_config *src)
             conf_role_add_ep(r, src->roles[i].eps[j].url);
             r->eps[r->nep - 1].completed = src->roles[i].eps[j].completed;
             r->eps[r->nep - 1].failed = src->roles[i].eps[j].failed;
+            /* Копируем per-endpoint параметры */
+            set_str(&r->eps[r->nep - 1].params.tag, src->roles[i].eps[j].params.tag);
+            set_str(&r->eps[r->nep - 1].params.state_dir, src->roles[i].eps[j].params.state_dir);
+            set_str(&r->eps[r->nep - 1].params.dtn_queue, src->roles[i].eps[j].params.dtn_queue);
+            r->eps[r->nep - 1].params.max_body   = src->roles[i].eps[j].params.max_body;
+            r->eps[r->nep - 1].params.pool_bytes = src->roles[i].eps[j].params.pool_bytes;
+            r->eps[r->nep - 1].params.free_mem   = src->roles[i].eps[j].params.free_mem;
+            r->eps[r->nep - 1].params.hello_secs = src->roles[i].eps[j].params.hello_secs;
+            r->eps[r->nep - 1].params.use_tcp    = src->roles[i].eps[j].params.use_tcp;
+            r->eps[r->nep - 1].params.use_dtn    = src->roles[i].eps[j].params.use_dtn;
         }
     }
     return d;
@@ -217,12 +248,48 @@ dc_config *conf_load(const char *path, char *err, size_t errlen)
                     goto fail;
                 }
                 if (str_ieq(key, "daemon") || str_ieq(key, "url") || str_ieq(key, "endpoint")) {
-                    if (conf_role_add_ep(r, value) != 0) {
+                    /* Формат: daemon = host:port [key=val ...]
+                     * Дополнительные параметры через пробел после адреса */
+                    char *val_copy = xstrdup(value);
+                    char *sp = strpbrk(val_copy, " \t");
+                    char *ep_params = NULL;
+                    if (sp) {
+                        *sp = '\0';
+                        ep_params = str_trim(sp + 1);
+                    }
+                    if (conf_role_add_ep(r, val_copy) != 0) {
                         snprintf(err, errlen, "%s:%d: слишком много узлов в роли %s",
                                  file, lineno, r->name);
+                        free(val_copy);
                         free(value);
                         goto fail;
                     }
+                    /* Парсим per-endpoint параметры */
+                    if (ep_params && *ep_params) {
+                        dc_endpoint *ep = &r->eps[r->nep - 1];
+                        char *tok = strtok(ep_params, " \t");
+                        while (tok) {
+                            char *eq = strchr(tok, '=');
+                            if (eq) {
+                                *eq = '\0';
+                                char *k = str_trim(tok);
+                                char *v = str_trim(eq + 1);
+                                if (str_ieq(k, "tag")) set_str(&ep->params.tag, v);
+                                else if (str_ieq(k, "state")) set_str(&ep->params.state_dir, v);
+                                else if (str_ieq(k, "state_dir")) set_str(&ep->params.state_dir, v);
+                                else if (str_ieq(k, "max_body") || str_ieq(k, "max-body")) ep->params.max_body = (int)strtol(v, NULL, 10);
+                                else if (str_ieq(k, "pool_bytes") || str_ieq(k, "pool-bytes")) ep->params.pool_bytes = strtol(v, NULL, 10);
+                                else if (str_ieq(k, "free_mem") || str_ieq(k, "free-mem")) ep->params.free_mem = strtol(v, NULL, 10);
+                                else if (str_ieq(k, "hello_interval") || str_ieq(k, "hello-interval")) ep->params.hello_secs = (int)strtol(v, NULL, 10);
+                                else if (str_ieq(k, "tcp")) ep->params.use_tcp = atoi(v) != 0;
+                                else if (str_ieq(k, "dtn")) ep->params.use_dtn = atoi(v) != 0;
+                                else if (str_ieq(k, "dtn_queue") || str_ieq(k, "dtn-queue")) set_str(&ep->params.dtn_queue, v);
+                                else log_debug("неизвестный параметр узла %s=%s", k, v);
+                            }
+                            tok = strtok(NULL, " \t");
+                        }
+                    }
+                    free(val_copy);
                     log_debug("роль %s -> %s", r->name, value);
                 }
                 free(value);
@@ -244,6 +311,24 @@ dc_config *conf_load(const char *path, char *err, size_t errlen)
             else if (str_ieq(key, "backoff_ms"))  cfg->backoff_ms = strtol(value, NULL, 10);
             else if (str_ieq(key, "outdir"))      set_str(&cfg->outdir, value);
             else log_debug("неизвестный ключ scheduler.%s", key);
+        } else if (str_ieq(section, "node")) {
+            /* Глобальные параметры демона для всех узлов */
+            if (str_ieq(key, "tag"))           set_str(&cfg->node_params.tag, value);
+            else if (str_ieq(key, "state"))     set_str(&cfg->node_params.state_dir, value);
+            else if (str_ieq(key, "state_dir")) set_str(&cfg->node_params.state_dir, value);
+            else if (str_ieq(key, "max_body"))  cfg->node_params.max_body = (int)strtol(value, NULL, 10);
+            else if (str_ieq(key, "max-body")) cfg->node_params.max_body = (int)strtol(value, NULL, 10);
+            else if (str_ieq(key, "pool_bytes")) cfg->node_params.pool_bytes = strtol(value, NULL, 10);
+            else if (str_ieq(key, "pool-bytes")) cfg->node_params.pool_bytes = strtol(value, NULL, 10);
+            else if (str_ieq(key, "free_mem"))  cfg->node_params.free_mem = strtol(value, NULL, 10);
+            else if (str_ieq(key, "free-mem"))  cfg->node_params.free_mem = strtol(value, NULL, 10);
+            else if (str_ieq(key, "hello_interval")) cfg->node_params.hello_secs = (int)strtol(value, NULL, 10);
+            else if (str_ieq(key, "hello-interval")) cfg->node_params.hello_secs = (int)strtol(value, NULL, 10);
+            else if (str_ieq(key, "tcp"))       cfg->node_params.use_tcp = atoi(value) != 0;
+            else if (str_ieq(key, "dtn"))       cfg->node_params.use_dtn = atoi(value) != 0;
+            else if (str_ieq(key, "dtn_queue")) set_str(&cfg->node_params.dtn_queue, value);
+            else if (str_ieq(key, "dtn-queue")) set_str(&cfg->node_params.dtn_queue, value);
+            else log_debug("неизвестный ключ node.%s", key);
         }
         free(value);
     }
@@ -278,10 +363,28 @@ int conf_save_example(const char *path)
         "max_new     = 512             # сколько токенов модель может нагенерировать\n"
         "payload_mode = expr           # expr — payload это арифметика; free — произвольный текст\n"
         "\n"
+        "[node]\n"
+        "# Глобальные параметры демона для ВСЕХ узлов. Можно переопределить\n"
+        "# per-endpoint в секциях [role]: daemon = host:port tag=mytag max_body=59986\n"
+        "# tag           = node            # имя узла в отчётах\n"
+        "# state         = state           # каталог для memory.log\n"
+        "# max_body      = 59986           # максимальный размер тела запроса (байт)\n"
+        "# free_mem      = 1048576         # память под веса модели (байт)\n"
+        "# pool_bytes    = 268435456       # размер пула весов, который узел выделяет\n"
+        "#                              # при старте (--pool-bytes). Это потолок:\n"
+        "#                              # больше free_mem он быть не может.\n"
+        "#                              # Уже работающий узел пул не меняет —\n"
+        "#                              # применяется при перезапуске.\n"
+        "# hello_interval = 10              # интервал broadcast HELLO (сек, 0 = выкл)\n"
+        "# tcp           = 0               # слушать TCP порт\n"
+        "# dtn           = 0               # DTN поверх TCP\n"
+        "# dtn_queue     = state/dtn       # каталог очереди DTN\n"
+        "\n"
         "[role %s]\n"
         "daemon = 127.0.0.1:9101       # вычисления (host:port)\n"
         "daemon = 127.0.0.1:9102       # второй вычислитель (балансировка)\n"
         "daemon = tcp://127.0.0.1:9111 # тот же узел через TCP, если UDP не годится\n"
+        "# per-endpoint параметры: daemon = 127.0.0.1:9101 tag=compute-1 max_body=59986\n"
         "\n"
         "[role %s]\n"
         "daemon = 127.0.0.1:9103       # проверка\n"
@@ -305,4 +408,109 @@ int conf_save_example(const char *path)
         ROLE_SHARD, ROLE_COMPUTE, ROLE_VERIFY, ROLE_MEMORIZE, ROLE_SHARD);
     fclose(f);
     return 0;
+}
+
+/* Эффективные параметры узла: per-endpoint переопределяют глобальные [node].
+ * Возвращает указатель на статический буфер (не сохранять). */
+dc_node_params *conf_effective_params(const dc_config *cfg, const dc_endpoint *ep)
+{
+    static dc_node_params eff;
+    const dc_node_params *g = &cfg->node_params;
+    const dc_node_params *p = ep ? &ep->params : NULL;
+
+    eff.tag        = (p && p->tag)        ? p->tag        : g->tag;
+    eff.state_dir  = (p && p->state_dir)  ? p->state_dir  : g->state_dir;
+    eff.dtn_queue  = (p && p->dtn_queue)  ? p->dtn_queue  : g->dtn_queue;
+    eff.max_body   = (p && p->max_body > 0)   ? p->max_body   : g->max_body;
+    eff.pool_bytes = (p && p->pool_bytes > 0) ? p->pool_bytes : g->pool_bytes;
+    eff.free_mem   = (p && p->free_mem > 0)   ? p->free_mem   : g->free_mem;
+    eff.hello_secs = (p && p->hello_secs > 0) ? p->hello_secs : g->hello_secs;
+    eff.use_tcp    = (p && p->use_tcp)    ? p->use_tcp    : g->use_tcp;
+    eff.use_dtn    = (p && p->use_dtn)    ? p->use_dtn    : g->use_dtn;
+
+    return &eff;
+}
+
+/* Генерирует команду запуска dcd для данного узла. Возвращает malloc'нутую строку. */
+char *conf_launch_cmd(const dc_config *cfg, const char *role, const dc_endpoint *ep)
+{
+    if (!ep) return NULL;
+    const dc_node_params *p = conf_effective_params(cfg, ep);
+
+    strbuf b;
+    sb_init(&b);
+    sb_add(&b, "dcd");
+
+    /* Роль узла — та, к которой он в конфигурации приписан. Раньше здесь стояло
+     * жёсткое «--role compute», и `dcctl launch` для роли shard предлагал
+     * запустить вычислитель: узел принимал бы не те запросы. */
+    if (role && *role) {
+        sb_add(&b, " --role ");
+        sb_add(&b, role);
+    } else {
+        sb_add(&b, " --role compute");
+    }
+
+    /* Порт из URL — поддерживаем udp://, tcp://, dtn:// и host:port */
+    char host[256];
+    int  port = 0;
+    char eperr[128] = {0};
+    if (udp_parse_endpoint(ep->url, host, sizeof host, &port, eperr, sizeof eperr) == 0 && port > 0) {
+        char portstr[16];
+        snprintf(portstr, sizeof portstr, "%d", port);
+        sb_add(&b, " --port ");
+        sb_add(&b, portstr);
+    } else {
+        /* Fallback: пытаемся извлечь порт из строки вручную */
+        const char *colon = strrchr(ep->url, ':');
+        if (colon && colon[1] >= '0' && colon[1] <= '9') {
+            sb_add(&b, " --port ");
+            sb_add(&b, colon + 1);
+        }
+    }
+
+    if (p->tag) {
+        sb_add(&b, " --tag ");
+        sb_add(&b, p->tag);
+    }
+    if (p->state_dir) {
+        sb_add(&b, " --state ");
+        sb_add(&b, p->state_dir);
+    }
+    if (p->max_body > 0) {
+        char buf[16];
+        snprintf(buf, sizeof buf, "%d", p->max_body);
+        sb_add(&b, " --max-body ");
+        sb_add(&b, buf);
+    }
+    if (p->pool_bytes > 0) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "%ld", p->pool_bytes);
+        sb_add(&b, " --pool-bytes ");
+        sb_add(&b, buf);
+    }
+    if (p->free_mem > 0) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "%ld", p->free_mem);
+        sb_add(&b, " --free-mem ");
+        sb_add(&b, buf);
+    }
+    if (p->hello_secs > 0) {
+        char buf[16];
+        snprintf(buf, sizeof buf, "%d", p->hello_secs);
+        sb_add(&b, " --hello-interval ");
+        sb_add(&b, buf);
+    }
+    if (p->use_tcp) {
+        sb_add(&b, " --tcp");
+    }
+    if (p->use_dtn) {
+        sb_add(&b, " --dtn");
+    }
+    if (p->dtn_queue) {
+        sb_add(&b, " --dtn-queue ");
+        sb_add(&b, p->dtn_queue);
+    }
+
+    return b.p ? b.p : xstrdup("dcd");
 }

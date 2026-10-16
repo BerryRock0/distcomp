@@ -1,6 +1,7 @@
 #include "conf.h"
 #include "expr.h"
 #include "engine.h"
+#include "json.h"
 #include "udp.h"
 #include "tcp.h"
 #include "dtn.h"
@@ -307,7 +308,7 @@ static void js_ws(js *j)
 /* Строка, в позиции j стоит открывающая кавычка. out==NULL — только проход.
  * Простые escape расподобляет, \uXXXX отдаёт сырым текстом (планировщик
  * разберёт сам). Обрезка по длине — молча: поля короткие. */
-static int js_str(js *j, char *out, size_t outsz)
+static int js_str_local(js *j, char *out, size_t outsz)
 {
     if (*j->p != '"') return 0;
     j->p++;
@@ -350,13 +351,13 @@ static void js_skip_value(js *j)
 {
     js_ws(j);
     char c = *j->p;
-    if (c == '"') { js_str(j, NULL, 0); return; }
+    if (c == '"') { js_str_local(j, NULL, 0); return; }
     if (c == '{' || c == '[') {
         int depth = 0;
         for (;;) {
             char d = *j->p;
             if (!d) return;
-            if (d == '"') { js_str(j, NULL, 0); continue; }
+            if (d == '"') { js_str_local(j, NULL, 0); continue; }
             if (d == '{' || d == '[') depth++;
             else if (d == '}' || d == ']') {
                 depth--;
@@ -388,14 +389,14 @@ static int js_obj_string(js *j, const char *key, char *out, size_t outsz)
         js_ws(j);
         if (*j->p == '}' || !*j->p) return 0;   /* '}' или конец — поля кончились */
         if (*j->p != '"') return 0;             /* мусор в объекте */
-        if (!js_str(j, kbuf, sizeof kbuf)) return 0;
+        if (!js_str_local(j, kbuf, sizeof kbuf)) return 0;
         js_ws(j);
         if (*j->p != ':') return 0;
         j->p++;
         js_ws(j);
         /* значение искомого поля обязано быть строкой: повторного поля с тем
          * же именем в объекте не бывает, искать дальше смысла нет */
-        if (strcmp(kbuf, key) == 0) return *j->p == '"' ? js_str(j, out, outsz) : 0;
+        if (strcmp(kbuf, key) == 0) return *j->p == '"' ? js_str_local(j, out, outsz) : 0;
         js_skip_value(j);
         js_ws(j);
         if (*j->p == ',') { j->p++; continue; }
@@ -424,7 +425,7 @@ static int js_obj_array(js *j, const char *key, js_ctx_cb cb, void *ud)
     for (;;) {
         js_ws(j);
         if (*j->p != '"') return 0;
-        if (!js_str(j, kbuf, sizeof kbuf)) return 0;
+        if (!js_str_local(j, kbuf, sizeof kbuf)) return 0;
         js_ws(j);
         if (*j->p != ':') return 0;
         j->p++;
@@ -670,7 +671,7 @@ static void role_memorize(const req_t *r, char *out, size_t outsz, char *detail,
  *   part|i|n                              i-й кусок результата по n байт
  */
 
-#define DC_SHARD_TENSORS 48
+#define DC_SHARD_TENSORS 48     /* по умолчанию; сверху задаётся --shard-tensors */
 #define DC_SHARD_NAME    48
 
 #ifndef DC_SHARD_RESB
@@ -689,20 +690,59 @@ typedef struct {
     unsigned long  dims[4];
 } shard_tensor;
 
-static unsigned char shard_pool[DC_SHARD_MAX_BYTES];
+/* Пул весов, который узел держит у себя.
+ *
+ * Раньше это был массив фиксированного размера DC_SHARD_MAX_BYTES в BSS, и
+ * размер зашивался при компиляции: чтобы узел взял больше мегабайта весов,
+ * нужно было пересобирать весь проект. Теперь размер задаётся при запуске
+ * флагом --pool-bytes (или из секции [node] конфигурации планировщика,
+ * см. conf.c и `dcctl launch`).
+ *
+ * На микроконтроллере malloc нет и быть не должно: там размер известен на
+ * этапе сборки, поэтому lite-вариант по-прежнему держит статический массив. */
+#ifdef DC_LITE
+static unsigned char shard_pool_static[DC_SHARD_MAX_BYTES];
+static unsigned char *shard_pool = shard_pool_static;
+static size_t        shard_cap   = DC_SHARD_MAX_BYTES;
+#else
+static unsigned char *shard_pool = NULL;
+static size_t        shard_cap   = 0;
+#endif
+
+/* Таблица тензоров узла. Размер приходит флагом --shard-tensors: у Qwen2
+ * на 14 слоёв приходится 126 тензоров, и прежних 48 не хватало — модель
+ * «великовата для одного устройства» при полной памяти. На lite, где malloc
+ * нет, остаётся зашитый при сборке размер. */
+#ifdef DC_LITE
 static shard_tensor  shard_t[DC_SHARD_TENSORS];
+static gguf_tensor  shard_gt[DC_SHARD_TENSORS];
+static size_t       shard_tcap = DC_SHARD_TENSORS;
+#else
+static shard_tensor *shard_t;
+static gguf_tensor *shard_gt;
+static size_t       shard_tcap = 0;
+#endif
 static int           shard_nt = 0;
 static size_t        shard_used = 0;
 
 /* собранный из пула «GGUF на минималках»: движок не должен знать, что файла нет */
 static gguf_file    shard_g;
-static gguf_tensor  shard_gt[DC_SHARD_TENSORS];
 static gguf_meta    shard_gm[16];
 static int          shard_gm_n;
 
 static llm_ctx       shard_ctx;
 static llm_layer     shard_layers[DC_SHARD_LAYERS];
-static float         shard_arena[DC_SHARD_ARENA];
+/* Арена под активации и KV-кэш. На сервере выделяется в куче по
+ * --arena-floats: у 14 слоёв Qwen2 с контекстом 512 её нужно 3.7 млн float
+ * (около 15 МБ), и прежних 256 тысяч не хватало — узел отвечал «дано
+ * 262144» при полном пуле весов. На lite остаётся зашитый размер. */
+#ifdef DC_LITE
+static float        shard_arena[DC_SHARD_ARENA];
+static size_t       shard_arena_n = DC_SHARD_ARENA;
+#else
+static float       *shard_arena;
+static size_t       shard_arena_n = 0;
+#endif
 static int           shard_ready;       /* контекст собран */
 static int           shard_res_n;       /* float в последнем результате */
 static int           shard_res_tok;     /* для стадии выхода: выбранный токен */
@@ -716,22 +756,21 @@ static void shard_reset_all(void)
     shard_res_n = 0;
     shard_res_tok = 0;
     memset(&shard_ctx, 0, sizeof shard_ctx);
-    memset(shard_t, 0, sizeof shard_t);
+    memset(shard_t, 0, shard_tcap * sizeof *shard_t);
 }
 
 /* Краткое описание для PONG/HELLO: что узел держит и сколько свободно. */
 static void shard_describe(char *out, size_t n)
 {
     if (!shard_ready) {
-        snprintf(out, n, "свободно %d из %d байт", (int)(DC_SHARD_MAX_BYTES - shard_used),
-                 (int)DC_SHARD_MAX_BYTES);
+        snprintf(out, n, "свободно %zu из %zu байт", shard_cap - shard_used, shard_cap);
         return;
     }
     const char *st = shard_ctx.stage == LLM_STAGE_EMBED
                        ? "вход"
                        : shard_ctx.stage == LLM_STAGE_HEAD ? "выход" : "слои";
-    snprintf(out, n, "%s %d..%d embd %d, занято %d из %d байт", st, shard_ctx.first,
-             shard_ctx.last, shard_ctx.n_embd, (int)shard_used, (int)DC_SHARD_MAX_BYTES);
+    snprintf(out, n, "%s %d..%d embd %d, занято %zu из %zu байт", st, shard_ctx.first,
+             shard_ctx.last, shard_ctx.n_embd, shard_used, shard_cap);
 }
 
 /* Находит тензор по имени; возвращает индекс или -1. */
@@ -792,23 +831,40 @@ static int shard_put(const req_t *r, char *out, size_t outsz, char *detail, size
     if (e == p || *e != '|') return -1;
     p = e + 1;
     if (!*p) return -1;
-    if (type > 1 || total == 0 || ndim == 0) return -1;
-    size_t esz = type == 1 ? 2 : 4;
-    size_t nbytes = 1;
+    if (total == 0 || ndim == 0) return -1;
+    /* размер тензора берём тем же правилом, что и при разборе файла:
+     * для F32/F16 это элементы на 4/2 байта, для квантов — блоки */
+    size_t nelem = 1;
     for (unsigned i = 0; i < ndim; i++) {
-        if (dims[i] == 0) return -1;
-        nbytes *= (size_t)dims[i];
+        if (!dims[i]) return -1;
+        nelem *= (size_t)dims[i];
     }
-    nbytes *= esz;
-    if (nbytes != total) return -1;      /* размеры и длина обязаны сойтись */
+    if (type == 0)      nelem *= 4;
+    else if (type == 1) nelem *= 2;
+    else {
+        /* блок 256 (K-квант) или 32 (старый квант) с фиксированным размером */
+        static const size_t ksz[] = { 84, 110, 144, 176, 210, 292 };
+        if (type >= 10 && type <= 15) {
+            if (nelem % 256) return -1;
+            nelem = nelem / 256 * ksz[type - 10];
+        } else if (type == 2 || type == 3 || (type >= 6 && type <= 8)) {
+            if (nelem % 32) return -1;
+            size_t one = (type == 2) ? 18u : (type == 3) ? 20u :
+                         (type == 6) ? 22u : (type == 7) ? 24u : 34u;
+            nelem = nelem / 32 * one;
+        } else {
+            return -1;
+        }
+    }
+    if (nelem != total) return -1;      /* размеры и длина обязаны сойтись */
 
     int slot = shard_find(name);
     if (slot < 0) {
-        if (shard_nt >= DC_SHARD_TENSORS) {
+        if (shard_nt >= (int)shard_tcap) {
             scpy(out, outsz, "ОШИБКА");
             scpy(detail, detailsz, "узел держит не более ");
-            scat_u(detail, detailsz, (unsigned long)DC_SHARD_TENSORS);
-            scat(detail, detailsz, " тензоров — модель великовата для одного устройства");
+            scat_u(detail, detailsz, (unsigned long)shard_tcap);
+            scat(detail, detailsz, " тензоров — увеличьте --shard-tensors");
             *ok = 0;
             return 0;
         }
@@ -833,12 +889,12 @@ static int shard_put(const req_t *r, char *out, size_t outsz, char *detail, size
         return 0;
     }
 
-    if (shard_t[slot].off + total > sizeof shard_pool) {
+    if (shard_t[slot].off + total > shard_cap) {
         scpy(out, outsz, "ОШИБКА");
         scpy(detail, detailsz, "в узле не хватает памяти: нужно ");
         scat_u(detail, detailsz, (unsigned long)total);
         scat(detail, detailsz, " байт, свободно ");
-        scat_u(detail, detailsz, (unsigned long)(sizeof shard_pool - shard_used));
+        scat_u(detail, detailsz, (unsigned long)(shard_cap - shard_used));
         *ok = 0;
         return 0;
     }
@@ -944,7 +1000,7 @@ static int shard_shape(const req_t *r, char *out, size_t outsz, char *detail, si
     shard_ready = 0;
     char err[512] = {0};
     if (llm_ctx_open(&shard_ctx, &shard_g, stage, first, last, n_ctx, shard_layers,
-                     shard_arena, DC_SHARD_ARENA, err, sizeof err) != 0) {
+                     shard_arena, shard_arena_n, err, sizeof err) != 0) {
         /* разбираем, каких тензоров не хватило, — планировщику это важно */
         char miss[384];
         miss[0] = '\0';
@@ -968,7 +1024,7 @@ static int shard_shape(const req_t *r, char *out, size_t outsz, char *detail, si
     scat(out, outsz, ", embd ");
     scat_u(out, outsz, (unsigned long)n_embd);
     scat(out, outsz, ", свободно ");
-    scat_u(out, outsz, (unsigned long)(sizeof shard_pool - shard_used));
+    scat_u(out, outsz, (unsigned long)(shard_cap - shard_used));
     *ok = 1;
     return 0;
 }
@@ -1041,7 +1097,7 @@ static int shard_part(const req_t *r, char *out, size_t outsz, int *ok)
     if (e == p || *e != '|') return -1;
     p = e + 1;
     long n = strtol(p, (char **)&e, 10);
-    if (e == p || i < 0 || n <= 0 || n > (long)sizeof shard_pool) return -1;
+    if (e == p || i < 0 || n <= 0 || n > (long)shard_cap) return -1;
     size_t off = (size_t)i;                 /* i — байтовое смещение в состоянии */
     if (off + (size_t)n > (size_t)shard_res_n * sizeof(float)) {
         scpy(out, outsz, "ОШИБКА");
@@ -1181,6 +1237,65 @@ static void send_error(int fd, const struct sockaddr_in *to, const char *msg)
     buf_t b;
     json_err(&b, msg);
     send_reply(fd, to, reply_buf);
+}
+
+/* Применяет параметры конфигурации от планировщика.
+ * Планировщик передаёт их в PING-запросе, чтобы узел мог настроить себя
+ * (max_body, hello_interval, транспорт и т.д.) без ручного запуска с флагами. */
+static void apply_scheduler_config(const char *json)
+{
+    if (!json || !*json) return;
+
+    char    err[192] = {0};
+    js_doc *d = js_parse(json, err, sizeof err);
+    if (!d) return;
+
+    const js_value *root = js_root(d);
+    double mb = js_num(js_get(root, "cfg_max_body"), 0);
+    double fm = js_num(js_get(root, "cfg_free_mem"), 0);
+    double hs = js_num(js_get(root, "cfg_hello_secs"), 0);
+    double ut = js_num(js_get(root, "cfg_use_tcp"), 0);
+    double ud = js_num(js_get(root, "cfg_use_dtn"), 0);
+    const char *tag = js_get_str(root, "cfg_tag");
+    const char *state = js_get_str(root, "cfg_state_dir");
+    const char *queue = js_get_str(root, "cfg_dtn_queue");
+
+    if (mb > 0 && mb < DC_MAX_BODY) {
+        N.max_body = (int)mb;
+        dprint("планировщик: max_body = %d\n", N.max_body);
+    }
+    if (fm > 0 && fm < DC_SHARD_MAX_BYTES) {
+        N.free_mem = (long)fm;
+        dprint("планировщик: free_mem = %ld\n", N.free_mem);
+    }
+    if (hs >= 0) {
+        /* hello_interval = 0 означает отключение broadcast */
+        dprint("планировщик: hello_interval = %.0f\n", hs);
+        /* Применяется при следующем HELLO — здесь только запоминаем */
+    }
+    if (ut >= 0) {
+        N.use_tcp = (int)ut;
+        dprint("планировщик: use_tcp = %d\n", N.use_tcp);
+    }
+    if (ud >= 0) {
+        N.use_dtn = (int)ud;
+        if (N.use_dtn) N.use_tcp = 1;  /* DTN работает поверх TCP */
+        dprint("планировщик: use_dtn = %d\n", N.use_dtn);
+    }
+    if (tag && *tag) {
+        scpy(N.tag, sizeof N.tag, tag);
+        dprint("планировщик: tag = %s\n", N.tag);
+    }
+    if (state && *state) {
+        scpy(N.state_dir, sizeof N.state_dir, state);
+        dprint("планировщик: state_dir = %s\n", N.state_dir);
+    }
+    if (queue && *queue) {
+        scpy(N.dtn_queue, sizeof N.dtn_queue, queue);
+        dprint("планировщик: dtn_queue = %s\n", N.dtn_queue);
+    }
+
+    js_doc_free(d);
 }
 
 static void send_pong(int fd, const struct sockaddr_in *to)
@@ -1469,6 +1584,15 @@ static void usage(const char *prog)
     dprint("               числу планировщик решает, какие слои положить сюда\n");
     dprint("               (по умолчанию %d, на Linux — свободная память)\n",
            DC_SHARD_MAX_BYTES);
+    dprint("  --pool-bytes N сколько байт весов модели узел готов держать.\n");
+    dprint("               Задаёт размер пула при запуске: планировщик\n");
+    dprint("               раскладывает по узлам столько, сколько они\n");
+    dprint("               объявили. По умолчанию %d.\n", DC_SHARD_MAX_BYTES);
+    dprint("  --shard-tensors N сколько тензоров модели узел готов держать\n");
+    dprint("               (по умолчанию %d; на 14 слоёв Qwen2 нужно 126)\n", 512);
+    dprint("  --arena-floats N  размер арены под активации и KV-кэш, float\n");
+    dprint("               (14 слоёв Qwen2 при контексте 512 просят ~3.7 млн;\n");
+    dprint("               по умолчанию на сервере %ld)\n", 4L << 20);
     dprint("  --hello-interval N  как часто объявлять себя по широковещанию,\n");
     dprint("               секунд (0 = не объявлять; по умолчанию %d)\n", DC_HELLO_SECS);
     dprint("  --tcp        слушать TCP порт (наряду с UDP)\n");
@@ -1492,13 +1616,14 @@ static long default_free_mem(void)
             if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1 && kb > 0) {
                 fclose(f);
                 long avail = kb * 1024;
-                return avail < (long)DC_SHARD_MAX_BYTES ? avail : (long)DC_SHARD_MAX_BYTES;
+                long cap   = shard_cap ? (long)shard_cap : (long)DC_SHARD_MAX_BYTES;
+                return avail < cap ? avail : cap;
             }
         }
         fclose(f);
     }
 #endif
-    return (long)DC_SHARD_MAX_BYTES;
+    return (long)(shard_cap ? shard_cap : (size_t)DC_SHARD_MAX_BYTES);
 }
 
 int main(int argc, char **argv)
@@ -1507,6 +1632,9 @@ int main(int argc, char **argv)
 
     int no_hello = 0;
     int hello_secs = DC_HELLO_SECS;
+    long pool_bytes = 0;   /* размер пула весов; 0 = DC_SHARD_MAX_BYTES */
+    long tensor_slots = 0;  /* сколько тензоров держать; 0 = DC_SHARD_TENSORS */
+    long arena_floats = 0; /* размер арены под активации; 0 = разумный перебор */
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1529,9 +1657,27 @@ int main(int argc, char **argv)
         } else if (strcmp(a, "--max-body") == 0 && i + 1 < argc) {
             int mb = atoi(argv[++i]);
             if (mb > 0 && mb < DC_MAX_BODY) N.max_body = mb;
+        } else if (strcmp(a, "--pool-bytes") == 0 && i + 1 < argc) {
+            pool_bytes = atol(argv[++i]);
+            if (pool_bytes <= 0) {
+                dprint("--pool-bytes нужно положительное число, получено: %s\n", argv[i]);
+                return 2;
+            }
+        } else if (strcmp(a, "--arena-floats") == 0 && i + 1 < argc) {
+            arena_floats = atol(argv[++i]);
+            if (arena_floats <= 0 || arena_floats > (100L << 20)) {
+                dprint("--arena-floats ожидаю 1..%ld, получено: %s\n", 100L << 20, argv[i]);
+                return 2;
+            }
+        } else if (strcmp(a, "--shard-tensors") == 0 && i + 1 < argc) {
+            tensor_slots = atol(argv[++i]);
+            if (tensor_slots <= 0 || tensor_slots > 100000) {
+                dprint("--shard-tensors ожидаю 1..100000, получено: %s\n", argv[i]);
+                return 2;
+            }
         } else if (strcmp(a, "--free-mem") == 0 && i + 1 < argc) {
             long fm = atol(argv[++i]);
-            if (fm > 0 && fm < DC_SHARD_MAX_BYTES) N.free_mem = fm;
+            if (fm > 0) N.free_mem = fm;   /* потолок проверим после выбора пула */
         } else if (strcmp(a, "--hello-interval") == 0 && i + 1 < argc) {
             hello_secs = atoi(argv[++i]);
             if (hello_secs <= 0) no_hello = 1;
@@ -1566,7 +1712,57 @@ int main(int argc, char **argv)
     if (!N.state_dir[0]) scpy(N.state_dir, sizeof N.state_dir, "state");
     if (!N.dtn_queue[0]) scpy(N.dtn_queue, sizeof N.dtn_queue, "state/dtn");
     if (N.max_body <= 0) N.max_body = DC_MAX_BODY;
+
+#ifndef DC_LITE
+    /* Размер пула весов решает, сколько модель вообще поместится на узле.
+     * Задаётся флагом --pool-bytes (в dcctl launch — из секции [node]);
+     * без него остаётся то, что зашито при сборке. */
+    shard_cap = pool_bytes > 0 ? (size_t)pool_bytes : (size_t)DC_SHARD_MAX_BYTES;
+    /* Разумный потолок: больше гигабайта под веса — это опечатка в конфиге,
+     * и malloc просто ушёл бы в никуда вместо внятного сообщения. */
+    if (shard_cap > (size_t)1 << 30) {
+        dprint("--pool-bytes больше 1 ГБ — не берём (похоже на опечатку)\n");
+        return 2;
+    }
+    shard_pool = malloc(shard_cap);
+    if (!shard_pool) {
+        dprint("не удалось выделить %zu байт под веса модели\n", shard_cap);
+        return 1;
+    }
+    /* таблица тензоров: на 14 слоёв Qwen2 нужно 126 записей, прежних 48
+     * не хватало даже при полной памяти узла */
+    shard_tcap = tensor_slots > 0 ? (size_t)tensor_slots : 512u;
+    shard_t  = xcalloc(shard_tcap, sizeof *shard_t);
+    shard_gt = xcalloc(shard_tcap, sizeof *shard_gt);
+    if (!shard_t || !shard_gt) {
+        dprint("не удалось выделить таблицу на %zu тензоров\n", shard_tcap);
+        return 1;
+    }
+    /* арена: у Qwen2 на 14 слоёв и контекст 512 нужно 3.7 млн float, то есть
+     * около 15 МБ; прежнего мегабайта не хватало */
+    shard_arena_n = arena_floats > 0 ? (size_t)arena_floats : (size_t)(4L << 20);
+    shard_arena = malloc(shard_arena_n * sizeof(float));
+    if (!shard_arena) {
+        dprint("не удалось выделить %zu float под активации (%zu байт)\n", shard_arena_n,
+               shard_arena_n * sizeof(float));
+        return 1;
+    }
+#else
+    if (pool_bytes > 0 && (size_t)pool_bytes != DC_SHARD_MAX_BYTES)
+        dprint("сборка lite: --pool-bytes %ld проигнорирован, пул %d байт\n",
+               pool_bytes, (int)DC_SHARD_MAX_BYTES);
+    if (tensor_slots > 0 && (size_t)tensor_slots != DC_SHARD_TENSORS)
+        dprint("сборка lite: --shard-tensors %ld проигнорирован, мест %d\n",
+               tensor_slots, DC_SHARD_TENSORS);
+    if (arena_floats > 0 && (size_t)arena_floats != DC_SHARD_ARENA)
+        dprint("сборка lite: --arena-floats %ld проигнорирован, арена %d float\n",
+               arena_floats, DC_SHARD_ARENA);
+#endif
+
+    /* Больше пула отдать нельзя: планировщик раскладывает веса по объёму,
+     * который узел сам объявил, и лишнее он примет и отбросит. */
     if (N.free_mem <= 0) N.free_mem = default_free_mem();
+    if (N.free_mem > (long)shard_cap) N.free_mem = (long)shard_cap;
     scpy(mpath, sizeof mpath, N.state_dir);
     scat(mpath, sizeof mpath, "/memory.log");
     if (role_allowed(2)) mem_count_init();
@@ -1723,6 +1919,14 @@ int main(int argc, char **argv)
         if (udp_unpack(buf, (size_t)r, &m, perr, sizeof perr) != 0) continue;
         if (m.type == DC_MSG_HELLO) continue;
         if (m.type == DC_MSG_PING) {
+            /* Принимаем параметры конфигурации от планировщика */
+            if (m.body_len > 0) {
+                char cfg_buf[512];
+                size_t cfg_len = m.body_len < sizeof cfg_buf - 1 ? m.body_len : sizeof cfg_buf - 1;
+                memcpy(cfg_buf, m.body, cfg_len);
+                cfg_buf[cfg_len] = '\0';
+                apply_scheduler_config(cfg_buf);
+            }
             send_pong(fd, &from);
             continue;
         }

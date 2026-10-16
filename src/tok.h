@@ -4,6 +4,7 @@
 #include "gguf.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * Токенизатор для моделей llama-семейства.
@@ -31,6 +32,18 @@ typedef struct {
     int      add_bos, add_eos;
     int      bos_id, eos_id;
     unsigned char byte_tok[256];   /* обратное отображение байт -> токен */
+
+    /* Строка -> id и пара -> ранг. Собраны один раз при открытии: раньше
+     * слияния искались перебором всего словаря (151387 слияний на 151936
+     * токенов — это десятки миллиардов сравнений), а это занимало минуты
+     * на каждый промпт. */
+    const char **map_key;
+    int         *map_val;
+    size_t       map_cap;
+    int64_t     *mg_key;      /* hash_pair(a,b), -1 — пусто */
+    int         *mg_rank;     /* приоритет: позиция в списке слияний */
+    int         *mg_id;       /* идентификатор склеенного токена */
+    size_t       mg_cap;
 } llm_tok;
 
 int  llm_tok_open(llm_tok *t, const gguf_file *g, char *err, size_t errlen);
