@@ -203,6 +203,7 @@ static void usage(FILE *out)
     "  llm                   проверить, что LLM настроена и отвечает\n"
 "  run  \"<цель>\"      построить план и выполнить его\n"
 "  run  -f план.json   выполнить уже готовый план\n"
+"  launch             показать команды запуска dcd для всех узлов из конфигурации\n"
 "  web  [--port 8080]  веб-панель управления (открыть в браузере)\n"
 "\n"
 "Опции:\n"
@@ -778,6 +779,30 @@ int main(int argc, char **argv)
         }
         printf("\nВстроенные роли: %s, %s, %s, %s\n", ROLE_COMPUTE, ROLE_VERIFY, ROLE_MEMORIZE,
                ROLE_SHARD);
+        conf_free(cfg);
+        free(goal_buf);
+        return 0;
+    }
+
+    /* ---------------------------------------------------- launch ---- */
+    if (strcmp(cmd, "launch") == 0) {
+        if (!conf_has_daemons(cfg)) {
+            log_error("ни одной роли не обеспечено узлом — запускать нечего.");
+            conf_free(cfg);
+            free(goal_buf);
+            return 3;
+        }
+        printf("Команды запуска dcd для узлов из конфигурации:\n\n");
+        for (int i = 0; i < cfg->nroles; i++) {
+            dc_role *r = &cfg->roles[i];
+            for (int j = 0; j < r->nep; j++) {
+                dc_endpoint *e = &r->eps[j];
+                char *cmd_str = conf_launch_cmd(cfg, r->name, e);
+                printf("# %s (%d)\n", r->name, j + 1);
+                printf("%s\n\n", cmd_str);
+                free(cmd_str);
+            }
+        }
         conf_free(cfg);
         free(goal_buf);
         return 0;

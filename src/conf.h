@@ -16,12 +16,28 @@
 #define ROLE_MEMORIZE "memorize"
 #define ROLE_SHARD    "shard"   /* часть модели: держит свои слои весов */
 
+/* Параметры демона вычислительного узла. Раньше они задавались только
+ * CLI-флагами dcd. Теперь их можно определить в конфигурации планировщика —
+ * либо глобально в секции [node], либо per-endpoint в секциях [role]. */
+typedef struct {
+    char *tag;           /* --tag: имя узла */
+    char *state_dir;     /* --state: каталог для memory.log */
+    int   max_body;      /* --max-body: максимальный размер тела запроса */
+    long  pool_bytes;    /* --pool-bytes: размер пула весов модели на узле */
+    long  free_mem;      /* --free-mem: память под веса модели */
+    int   hello_secs;    /* --hello-interval: интервал broadcast HELLO */
+    int   use_tcp;       /* --tcp: слушать TCP порт */
+    int   use_dtn;       /* --dtn: DTN поверх TCP */
+    char *dtn_queue;     /* --dtn-queue: каталог очереди DTN */
+} dc_node_params;
+
 typedef struct {
     char *url;
-    long  inflight;   /* runtime */
-    long  completed;  /* runtime */
-    long  failed;     /* runtime */
-    dc_capability cap; /* что узел умеет; заполняется по PONG/HELLO */
+    long  inflight;      /* runtime */
+    long  completed;     /* runtime */
+    long  failed;        /* runtime */
+    dc_capability cap;   /* что узел умеет; заполняется по PONG/HELLO */
+    dc_node_params params; /* per-endpoint параметры (переопределяют глобальные) */
 } dc_endpoint;
 
 typedef struct {
@@ -49,6 +65,9 @@ typedef struct {
     long  timeout_ms;
     long  backoff_ms;
     char *outdir;
+
+    /* [node] — глобальные параметры демона для всех узлов */
+    dc_node_params node_params;
 } dc_config;
 
 dc_config *conf_new(void);
@@ -63,5 +82,13 @@ dc_config *conf_clone(const dc_config *src);
 dc_role *conf_role(dc_config *cfg, const char *name, int create);
 int      conf_role_add_ep(dc_role *r, const char *url);
 int      conf_has_daemons(const dc_config *cfg);
+
+/* Эффективные параметры узла: per-endpoint переопределяют глобальные [node].
+ * Возвращает указатель на статический буфер (не сохранять). */
+dc_node_params *conf_effective_params(const dc_config *cfg, const dc_endpoint *ep);
+
+/* Генерирует команду запуска dcd для данного узла. role — имя роли из
+ * конфигурации, оно превращается в «--role». Возвращает malloc'нутую строку. */
+char *conf_launch_cmd(const dc_config *cfg, const char *role, const dc_endpoint *ep);
 
 #endif /* DC_CONF_H */

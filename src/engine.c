@@ -128,6 +128,9 @@ size_t llm_ctx_floats(const gguf_file *g, int stage, int first, int last, int n_
     n += (size_t)wide;                               /* xs */
     n += 2 * (size_t)c.n_head * c.head_dim;          /* q, att */
     n += 2 * (size_t)c.n_head_kv * c.head_dim;      /* k, v */
+    /* развёрнутые смещения Q/K/V — только у стадии слоёв */
+    if (nlayers > 0)
+        n += (size_t)c.n_head * c.head_dim + 2 * (size_t)c.n_head_kv * c.head_dim;
     n += (size_t)c.head_dim;                         /* qh */
     n += (size_t)c.n_ctx;                            /* scores */
     if (stage == LLM_STAGE_HEAD) n += (size_t)c.n_vocab;
@@ -145,9 +148,14 @@ int llm_ctx_open(llm_ctx *c, const gguf_file *g, int stage, int first, int last,
     memset(c, 0, sizeof *c);
     const char *arch = gguf_str(g, "general.architecture");
     if (!arch) ERR("в модели нет general.architecture");
-    if (strcmp(arch, "llama") != 0)
+    if (arch[0] == '\0') ERR("в модели нет general.architecture");
+    /* LLaMA и Mistral пишут general.architecture = "llama", а Qwen2 — "qwen2",
+     * и раскладка тензоров у них одна и та же (blk.N.attn_norm.weight,
+     * attn_q/k/v, ffn_gate/up/down). Раньше "qwen2" отвергался, хотя
+     * соседняя строка ошибки обещала поддержку Qwen2. */
+    if (strcmp(arch, "llama") != 0 && strcmp(arch, "qwen2") != 0)
         ERR("архитектура «%s» не поддерживается: движок умеет llama "
-            "(LLaMA, Mistral, Qwen2)", arch);
+            "(LLaMA, Mistral) и qwen2 (Qwen2)", arch);
     if (read_shape(g, arch, c, err, errlen) != 0) return -1;
     if (n_ctx > 0) c->n_ctx = n_ctx;
     if (stage == LLM_STAGE_LAYERS && (last < first || last >= c->n_layer))
@@ -192,6 +200,14 @@ int llm_ctx_open(llm_ctx *c, const gguf_file *g, int stage, int first, int last,
                 w[k]->t = gguf_tensor_find(g, name);
                 if (!w[k]->t) ERR("в модели нет тензор %s", name);
             }
+            /* Смещения есть не у всех архитектур: у Qwen2 у Q, K и V они
+             * есть, у llama — нет. Отсутствие не ошибка. */
+            l->bias.q = gguf_tensor_find(g, (snprintf(name, sizeof name,
+                                 "blk.%d.attn_q.bias", idx), name));
+            l->bias.k = gguf_tensor_find(g, (snprintf(name, sizeof name,
+                                 "blk.%d.attn_k.bias", idx), name));
+            l->bias.v = gguf_tensor_find(g, (snprintf(name, sizeof name,
+                                 "blk.%d.attn_v.bias", idx), name));
         }
     }
 
@@ -210,6 +226,13 @@ int llm_ctx_open(llm_ctx *c, const gguf_file *g, int stage, int first, int last,
     c->att = p;   p += (size_t)c->n_head * c->head_dim;
     c->k = p;     p += (size_t)c->n_head_kv * c->head_dim;
     c->v = p;     p += (size_t)c->n_head_kv * c->head_dim;
+    /* развёрнутые смещения Q/K/V: они не меняются от токена к токену, так
+     * что один раз при открытии, а не на каждом шаге */
+    if (stage == LLM_STAGE_LAYERS) {
+        c->bqq = p; p += (size_t)c->n_head * c->head_dim;
+        c->bkq = p; p += (size_t)c->n_head_kv * c->head_dim;
+        c->bvq = p; p += (size_t)c->n_head_kv * c->head_dim;
+    }
     c->qh = p;    p += c->head_dim;
     c->scores = p; p += c->n_ctx;
     if (stage == LLM_STAGE_HEAD) { c->logits = p; p += (size_t)c->n_vocab; }
@@ -237,41 +260,73 @@ static void rms_norm(float *dst, const float *x, const float *w, int n, float ep
     for (int i = 0; i < n; i++) dst[i] = x[i] * scale * w[i];
 }
 
-/* y[j] = sum_i W[i*ne1 + j] * x[i]. F16 разворачивается построчно: так
- * внутренний цикл остаётся с плавающей арифметикой, а вызовов на каждый вес
- * не будет. */
+/* y[out] = sum_in W[in + out*n_in] * x[in]
+ *
+ * Раскладка именно такая: в ggml тензор [ne0, ne1] лежит элементом (i0, i1)
+ * по адресу i0 + i1*ne0, то есть непрерывное измерение — ne0, и для весов
+ * это вход. Раньше здесь стояло `row = raw + i*n_out` и суммирование
+ * r[j]*x[i], то есть чтение транспонированной матрицы: для квадратных
+ * весов (attn_q) это незаметно, а для attn_k [ne, n_head_kv*hd] и ffn_down
+ * даёт правдоподобный, но бессмысленный результат.
+ *
+ * F32 и F16 читаются подряд; для квантов блок в 256 (или 32) весов
+ * разворачивается в wbuf и домножается. */
 static void matvec(float *y, const gguf_tensor *w, const float *x, int n_in, int n_out,
                    float *scratch)
 {
     const unsigned char *raw = w->data;
     int                 is_f16 = w->type == 1;
+    int                 is_f32 = w->type == 0;
 
-    for (int j = 0; j < n_out; j++) y[j] = 0.0f;
-    for (int i = 0; i < n_in; i++) {
-        float xi = x[i];
-        const unsigned char *row = raw + (size_t)i * (size_t)n_out * (is_f16 ? 2u : 4u);
-        const float          *r;
-        if (is_f16) {
-            const unsigned short *h = (const unsigned short *)(const void *)row;
-            for (int j = 0; j < n_out; j++) scratch[j] = f16_at(h + j);
-            r = scratch;
-        } else {
-            r = (const float *)(const void *)row;
+    if (is_f32 || is_f16) {
+        size_t esz = is_f16 ? 2u : 4u;
+        for (int out = 0; out < n_out; out++) {
+            const unsigned char *col = raw + (size_t)out * (size_t)n_in * esz;
+            float               acc = 0.0f;
+            if (is_f16) {
+                const unsigned short *h = (const unsigned short *)(const void *)col;
+                for (int in = 0; in < n_in; in++) acc += f16_at(h + in) * x[in];
+            } else {
+                const float *f = (const float *)(const void *)col;
+                for (int in = 0; in < n_in; in++) acc += f[in] * x[in];
+            }
+            y[out] = acc;
         }
-        for (int j = 0; j < n_out; j++) y[j] += r[j] * xi;
+        return;
+    }
+
+    /* кванты: блок лежит вдоль входа, блоки идут подряд по каждому out */
+    size_t blk = (w->type >= 10 && w->type <= 15) ? 256u : 32u;
+    if ((size_t)n_in % blk) {              /* ggml такое не порождает */
+        for (int out = 0; out < n_out; out++) y[out] = 0.0f;
+        return;
+    }
+
+    /* Буфер на один блок: xs бывает уже 256 float (у крошечной модели), поэтому
+     * декодируем в локальный — 1 КБ стека, приемлемо и для узла. */
+    float blkbuf[256];
+
+    for (int out = 0; out < n_out; out++) {
+        size_t col_elems = (size_t)out * (size_t)n_in;
+        size_t nb        = (size_t)n_in / blk;
+        float  acc       = 0.0f;
+        for (size_t bi = 0; bi < nb; bi++) {
+            if (gguf_dequant(w, blkbuf, col_elems + bi * blk, blk) != 0) {
+                y[out] = 0.0f;
+                return;
+            }
+            const float *xs = x + bi * blk;
+            for (size_t k = 0; k < blk; k++) acc += blkbuf[k] * xs[k];
+        }
+        y[out] = acc;
     }
 }
 
-/* разворачивает один ряд тензора в float */
+/* разворачивает n элементов тензора, начиная с элемента off, в float */
 static void row_to_float(const gguf_tensor *t, float *dst, size_t off, size_t n)
 {
-    const unsigned char *p = t->data + off * (t->type == 1 ? 2u : 4u);
-    if (t->type == 0) {
-        memcpy(dst, p, sizeof(float) * n);
-    } else {
-        const unsigned short *h = (const unsigned short *)(const void *)p;
-        for (size_t i = 0; i < n; i++) dst[i] = f16_at(h + i);
-    }
+    if (gguf_dequant(t, dst, off, n) != 0)
+        for (size_t i = 0; i < n; i++) dst[i] = 0.0f;
 }
 
 /* RoPE: пары (x, y) поворачиваются на угол pos * base^(-2i/d) */
@@ -299,6 +354,21 @@ static void forward_layer(llm_ctx *c, llm_layer *l, int li, float *x)
     matvec(c->q, l->attn_q.t, c->xb, ne, nh * hd, c->xs);
     matvec(c->k, l->attn_k.t, c->xb, ne, nkv * hd, c->xs);
     matvec(c->v, l->attn_v.t, c->xb, ne, nkv * hd, c->xs);
+
+    /* Смещения прибавляем после matmul и до RoPE — так же, как их считают
+     * в llama.cpp. У Qwen2 без этого Q и K уезжают, и модель выдаёт мусор. */
+    if (l->bias.q) {
+        row_to_float(l->bias.q, c->bqq, 0, (size_t)(nh * hd));
+        for (int i = 0; i < nh * hd; i++) c->q[i] += c->bqq[i];
+    }
+    if (l->bias.k) {
+        row_to_float(l->bias.k, c->bkq, 0, (size_t)(nkv * hd));
+        for (int i = 0; i < nkv * hd; i++) c->k[i] += c->bkq[i];
+    }
+    if (l->bias.v) {
+        row_to_float(l->bias.v, c->bvq, 0, (size_t)(nkv * hd));
+        for (int i = 0; i < nkv * hd; i++) c->v[i] += c->bvq[i];
+    }
 
     size_t  kv_dim = (size_t)nkv * hd;
     size_t  plane = (size_t)c->n_ctx * kv_dim;
@@ -366,16 +436,17 @@ int llm_forward(llm_ctx *c, int token, float *out)
     if (!c || !out) return -1;
 
     if (c->stage == LLM_STAGE_EMBED) {
-        /* Таблица эмбеддингов [n_embd, n_vocab] лежит так, что элемент (i, j)
-         * стоит по адресу i*n_vocab + j. Вектор токена — это столбец j, то есть
-         * числа идут через шаг n_vocab, а не подряд. */
+        /* Таблица эмбеддингов [n_embd, n_vocab] лежит по правилам ggml:
+         * элемент (i, j) — по адресу i + j*n_embd, то есть вектор токена
+         * это j*n_embd .. j*n_embd+n_embd, и числа идут подряд.
+         * Раньше тут стояло i*n_vocab + j — шаг по n_vocab, то есть чтение
+         * через строку: вектор получался из n_embd разных «столбцов» таблицы
+         * и для n_embd != n_vocab был бессмысленным. */
         const gguf_tensor *t = c->w_emb.t;
         int n_rows = t->n_dims == 2 ? (int)t->dims[1] : c->n_vocab;
         int ne = c->n_embd;
         if (token < 0 || token >= n_rows) return -1;
-        size_t step = (t->n_dims == 2) ? (size_t)t->dims[1] : (size_t)n_rows;
-        for (int i = 0; i < ne; i++)
-            row_to_float(t, out + i, (size_t)i * step + (size_t)token, 1);
+        row_to_float(t, out, (size_t)token * (size_t)ne, (size_t)ne);
         return 0;
     }
 
