@@ -20,6 +20,11 @@
 #include <unistd.h>
 
 #define MAX_BODY   (1 << 20)
+
+/* Чат держит соединение минутами: модель загружается десятки секунд, а ответ
+ * идёт по одному токену за шаг конвейера через сеть. Обычный таймаут в 30 с
+ * обрывал бы поток на середине. */
+#define DC_CHAT_TIMEOUT_S 1800
 #define MAX_RUNS   64
 
 /* ------------------------------------------------------- реестр ------ */
@@ -62,6 +67,17 @@ struct dc_web {
     char             api_base[32];
     int              no_llm;
     volatile int     stopping;
+
+    /* Чат. Модель разложена по узлам один раз и живёт здесь: разложение и
+     * заливка весов занимают десятки секунд, а перезагружать её на каждое
+     * сообщение нельзя. Генерация идёт по одному потоку — состояние конвейера
+     * общее, поэтому chat_mu держит и сам конвейер, и историю разговора. */
+    dc_infer        *chat_infer;
+    pthread_mutex_t  chat_mu;
+    strbuf           chat_hist;        /* реплики в формате ChatML */
+    int              chat_ready;       /* 1 — модель загружена и готова */
+    int              chat_busy;        /* 1 — идёт генерация */
+    char             chat_err[512];    /* почему не загрузилась */
 };
 
 /* -------------------------------------------------------- утилиты ----- */
@@ -701,10 +717,209 @@ static void api_llm(dc_web *w, int fd)
     sb_free(&b);
 }
 
-/* Потоки соединений живут отдельно и после web_stop могут ещё дочитывать
- * сокет. Освобождать dc_web под ними нельзя, поэтому после остановки сервера
- * структуру намеренно не трогаем: процесс всё равно завершается, а use-after-free
- * на выходе — это падение вместо тихого выхода. */
+/* ----------------------------------------------------------------- чат --- */
+
+/* Одно событие потока: "data: {...}\n\n". Отдельные записи нужны, чтобы
+ * сообщение не разрезалось на части, даже если пришло по TCP двумя кусками. */
+static int sse_send(int fd, const char *json)
+{
+    char line[4096];
+    int  n = snprintf(line, sizeof line, "data: %s\n\n", json);
+    if (n < 0) return -1;
+    size_t off = 0;
+    size_t len = (size_t)n < sizeof line ? (size_t)n : sizeof line - 1;
+    while (off < len) {
+        ssize_t w = write(fd, line + off, len - off);
+        if (w <= 0) return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+static void sse_event(int fd, const char *kind, const char *text, int tok, long ms)
+{
+    strbuf b;
+    sb_init(&b);
+    sb_add(&b, "{\"type\":");
+    sb_add_json_string(&b, kind);
+    if (text) {
+        sb_add(&b, ",\"text\":");
+        sb_add_json_string(&b, text);
+    }
+    if (tok >= 0) sb_printf(&b, ",\"tok\":%d", tok);
+    if (ms >= 0)  sb_printf(&b, ",\"ms\":%ld", ms);
+    sb_add(&b, "}");
+    sse_send(fd, b.p);
+    sb_free(&b);
+}
+
+/* Загрузка модели под чат. Долгая (десятки секунд: раскладка по узлам и
+ * заливка весов), поэтому ответ идёт потоком: браузер сразу видит, что
+ * процесс идёт, а не молчит минуту до первого байта. */
+static void chat_load(dc_web *w, int fd)
+{
+    const char *hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream; charset=utf-8\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    if (write(fd, hdr, strlen(hdr)) < 0) return;
+
+    char err[512] = {0};
+    long t0 = now_ms();
+    sse_event(fd, "start", "разкладываю модель по узлам…", -1, -1);
+    dc_infer *in = llm_open_chat(w->cfg, w->cfg->max_new, err, sizeof err);
+    long ms = now_ms() - t0;
+
+    pthread_mutex_lock(&w->chat_mu);
+    if (in) {
+        w->chat_infer = in;
+        w->chat_ready = 1;
+        w->chat_err[0] = '\0';
+    } else {
+        w->chat_ready = 0;
+        snprintf(w->chat_err, sizeof w->chat_err, "%s", err);
+    }
+    int ready = w->chat_ready;
+    char saved[512];
+    snprintf(saved, sizeof saved, "%s", w->chat_err);
+    pthread_mutex_unlock(&w->chat_mu);
+
+    if (ready) {
+        sse_event(fd, "loaded", "модель загружена", -1, ms);
+    } else {
+        sse_event(fd, "error", saved, -1, ms);
+    }
+}
+
+typedef struct {
+    dc_web *w;
+    int     fd;
+} chat_stream;
+
+static int chat_on_token(int tok, const char *text, void *ud)
+{
+    chat_stream *cs = (chat_stream *)ud;
+    sse_event(cs->fd, "token", text, tok, -1);
+    return !cs->w->stopping;
+}
+
+/* POST /api/chat — весь разговор приходит сюда, ответ уходит потоком. */
+static void api_chat(dc_web *w, int fd, const char *body)
+{
+    js_doc *d = js_parse(body ? body : "{}", NULL, 0);
+    const char *msg = d ? js_get_str(js_root(d), "message") : NULL;
+    int max_new = 0;
+    if (d) {
+        const js_value *mn = js_get(js_root(d), "max_new");
+        if (mn && mn->type == JS_NUM) max_new = (int)mn->num;
+    }
+    char message[16384] = {0};
+    if (msg) snprintf(message, sizeof message, "%s", msg);
+    if (d) js_doc_free(d);
+
+    const char *hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream; charset=utf-8\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    if (write(fd, hdr, strlen(hdr)) < 0) return;
+
+    if (!message[0]) {
+        sse_event(fd, "error", "пустое сообщение", -1, -1);
+        return;
+    }
+
+    pthread_mutex_lock(&w->chat_mu);
+    if (!w->chat_ready) {
+        char saved[512];
+        snprintf(saved, sizeof saved, "%s", w->chat_err);
+        int have = w->chat_infer != NULL;
+        pthread_mutex_unlock(&w->chat_mu);
+        if (have) {
+            sse_event(fd, "error", "модель ещё не загружена", -1, -1);
+        } else {
+            sse_event(fd, "error",
+                      saved[0] ? saved
+                               : "модель не загружена: укажите model_file в [llm] "
+                                 "и узлы роли shard, затем нажмите «Загрузить модель»",
+                      -1, -1);
+        }
+        return;
+    }
+    dc_infer *in = w->chat_infer;
+    pthread_mutex_unlock(&w->chat_mu);
+
+    char *sys  = xstrdup(llm_chat_system(w->cfg));
+    char *prompt = llm_chat_prompt(sys, w->chat_hist.p ? w->chat_hist.p : "", message);
+    free(sys);
+
+    sse_event(fd, "start", "", -1, -1);
+    long t0 = now_ms();
+
+    chat_stream cs = { .w = w, .fd = fd };
+    char err[512] = {0};
+    char *answer = dc_infer_generate_cb(in, prompt, max_new > 0 ? max_new : w->cfg->max_new,
+                                        chat_on_token, &cs, err, sizeof err);
+    long ms = now_ms() - t0;
+
+    if (!answer) {
+        sse_event(fd, "error", err, -1, ms);
+        free(prompt);
+        return;
+    }
+
+    /* реплики в историю — только после успешного ответа */
+    pthread_mutex_lock(&w->chat_mu);
+    llm_chat_history_add(&w->chat_hist, "user", message);
+    llm_chat_history_add(&w->chat_hist, "assistant", answer);
+    pthread_mutex_unlock(&w->chat_mu);
+
+    free(prompt);
+    sse_event(fd, "done", answer, -1, ms);
+    free(answer);
+}
+
+/* POST /api/chat/reset — начать разговор заново. Модель остаётся загруженной. */
+static void api_chat_reset(dc_web *w, int fd)
+{
+    pthread_mutex_lock(&w->chat_mu);
+    sb_free(&w->chat_hist);
+    sb_init(&w->chat_hist);
+    pthread_mutex_unlock(&w->chat_mu);
+    strbuf b;
+    sb_init(&b);
+    sb_add(&b, "{\"ok\":true}");
+    reply_json(fd, 200, &b);
+    sb_free(&b);
+}
+
+/* GET /api/chat — состояние чата для панели. */
+static void api_chat_state(dc_web *w, int fd)
+{
+    strbuf b;
+    sb_init(&b);
+    pthread_mutex_lock(&w->chat_mu);
+    int ready = w->chat_ready;
+    char saved[512];
+    snprintf(saved, sizeof saved, "%s", w->chat_err);
+    int ctx = w->chat_infer ? dc_infer_n_ctx(w->chat_infer) : 0;
+    int nodes = w->chat_infer ? dc_infer_n_nodes(w->chat_infer) : 0;
+    pthread_mutex_unlock(&w->chat_mu);
+
+    sb_add(&b, "{\"ok\":true,\"ready\":");
+    sb_add(&b, ready ? "true" : "false");
+    sb_add(&b, ",\"error\":");
+    sb_add_json_string(&b, ready ? "" : (saved[0] ? saved
+                                  : "модель не загружена: укажите model_file в [llm] "
+                                    "и узлы роли shard"));
+    sb_printf(&b, ",\"n_ctx\":%d,\"nodes\":%d}", ctx, nodes);
+    reply_json(fd, 200, &b);
+    sb_free(&b);
+}
+
 
 /* ------------------------------------------------------- соединение --- */
 
@@ -789,11 +1004,15 @@ static void *conn_thread(void *arg)
 
     /* маршруты строим от api_base, чтобы его можно было переопределить */
     char base[64], r_state[80], r_run[80], r_role[80], r_llm[80];
+    char r_chat[80], r_chat_reset[96], r_chat_load[96];
     snprintf(base, sizeof base, "%s", w->api_base);
     snprintf(r_state, sizeof r_state, "%s/state", base);
     snprintf(r_run, sizeof r_run, "%s/run", base);
     snprintf(r_role, sizeof r_role, "%s/role", base);
     snprintf(r_llm, sizeof r_llm, "%s/llm", base);
+    snprintf(r_chat, sizeof r_chat, "%s/chat", base);
+    snprintf(r_chat_reset, sizeof r_chat_reset, "%s/chat/reset", base);
+    snprintf(r_chat_load, sizeof r_chat_load, "%s/chat/load", base);
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
         http_reply(fd, 200, "text/html; charset=utf-8", web_ui_html(),
@@ -817,6 +1036,28 @@ static void *conn_thread(void *arg)
         api_role(w, fd, body);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, r_llm) == 0) {
         api_llm(w, fd);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, r_chat) == 0) {
+        api_chat_state(w, fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, r_chat) == 0) {
+        /* Ответ идёт потоком и живёт дольше обычного запроса: пока модель
+         * думает, соединение должно держаться, а не отваливаться по таймауту. */
+        struct timeval big = { DC_CHAT_TIMEOUT_S, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &big, sizeof big);
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &big, sizeof big);
+        pthread_mutex_lock(&w->chat_mu);
+        w->chat_busy = 1;
+        pthread_mutex_unlock(&w->chat_mu);
+        api_chat(w, fd, body);
+        pthread_mutex_lock(&w->chat_mu);
+        w->chat_busy = 0;
+        pthread_mutex_unlock(&w->chat_mu);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, r_chat_load) == 0) {
+        struct timeval big = { DC_CHAT_TIMEOUT_S, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &big, sizeof big);
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &big, sizeof big);
+        chat_load(w, fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, r_chat_reset) == 0) {
+        api_chat_reset(w, fd);
     } else if (strcmp(method, "GET") == 0 && (strcmp(path, "/favicon.ico") == 0)) {
         /* без этого каждая вкладка оставляет в логе 404 */
         http_reply(fd, 204, "image/x-icon", "", 0);
@@ -844,6 +1085,8 @@ dc_web *web_start(dc_config *cfg, const char *host, int port, const char *api_ba
     snprintf(w->api_base, sizeof w->api_base, "%s", api_base && *api_base ? api_base : "/api");
     pthread_mutex_init(&w->mu, NULL);
     pthread_mutex_init(&w->run_mu, NULL);
+    pthread_mutex_init(&w->chat_mu, NULL);
+    sb_init(&w->chat_hist);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -927,7 +1170,10 @@ void web_free(dc_web *w)
         free(r);
         r = next;
     }
+    dc_infer_free(w->chat_infer);
+    sb_free(&w->chat_hist);
     pthread_mutex_destroy(&w->mu);
     pthread_mutex_destroy(&w->run_mu);
+    pthread_mutex_destroy(&w->chat_mu);
     free(w);
 }

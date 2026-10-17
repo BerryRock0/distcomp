@@ -50,6 +50,10 @@ dc_config *conf_new(void)
     cfg->n_ctx        = 0;      /* 0 — движок подставит разумное значение */
     cfg->max_new      = 512;
     cfg->payload_mode = xstrdup("expr");
+    /* чат: пустой system — встроенный текст, 8 сообщений истории достаточно
+     * для обычного разговора и не съедает контекст целиком */
+    cfg->chat_system  = xstrdup("");
+    cfg->chat_history = 8;
     cfg->concurrency  = 4;
     cfg->retries      = 2;
     cfg->timeout_ms   = 60000;
@@ -65,6 +69,7 @@ void conf_free(dc_config *cfg)
     if (!cfg) return;
     free(cfg->model_file);
     free(cfg->payload_mode);
+    free(cfg->chat_system);
     free(cfg->outdir);
     free(cfg->node_params.tag);
     free(cfg->node_params.state_dir);
@@ -118,9 +123,11 @@ dc_config *conf_clone(const dc_config *src)
     dc_config *d = conf_new();
     set_str(&d->model_file, src->model_file);
     set_str(&d->payload_mode, src->payload_mode);
+    set_str(&d->chat_system, src->chat_system);
     set_str(&d->outdir, src->outdir);
     d->n_ctx        = src->n_ctx;
     d->max_new      = src->max_new;
+    d->chat_history = src->chat_history;
     d->concurrency  = src->concurrency;
     d->retries      = src->retries;
     d->timeout_ms   = src->timeout_ms;
@@ -304,6 +311,10 @@ dc_config *conf_load(const char *path, char *err, size_t errlen)
             else if (str_ieq(key, "max_new"))      cfg->max_new = (int)strtol(value, NULL, 10);
             else if (str_ieq(key, "payload_mode")) set_str(&cfg->payload_mode, value);
             else log_debug("неизвестный ключ llm.%s", key);
+        } else if (str_ieq(section, "chat")) {
+            if (str_ieq(key, "system"))        set_str(&cfg->chat_system, value);
+            else if (str_ieq(key, "history"))  cfg->chat_history = (int)strtol(value, NULL, 10);
+            else log_debug("неизвестный ключ chat.%s", key);
         } else if (str_ieq(section, "scheduler")) {
             if (str_ieq(key, "concurrency"))     cfg->concurrency = (int)strtol(value, NULL, 10);
             else if (str_ieq(key, "retries"))     cfg->retries = (int)strtol(value, NULL, 10);
@@ -362,6 +373,13 @@ int conf_save_example(const char *path)
         "                             # больше памяти под KV-кэш (потолок 4096)\n"
         "max_new     = 512             # сколько токенов модель может нагенерировать\n"
         "payload_mode = expr           # expr — payload это арифметика; free — произвольный текст\n"
+        "\n"
+        "[chat]\n"
+        "# Веб-чат. Модель и разложение те же, что в [llm], но системный промпт\n"
+        "# другой: здесь модель отвечает человеку. Пустая строка — встроенный\n"
+        "# текст, своей строкой можно задать свой.\n"
+        "system  =\n"
+        "history = 8                    # сколько последних сообщений класть в контекст\n"
         "\n"
         "[node]\n"
         "# Глобальные параметры демона для ВСЕХ узлов. Можно переопределить\n"

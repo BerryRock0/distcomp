@@ -33,6 +33,9 @@ TESTBIN := $(BIN)/expr_test
 # незаметно. Здесь сравниваются все 256 весов блока с эталоном.
 QUANTBIN := $(BIN)/quant_test
 QUANTREAL := $(BIN)/quant_real
+# Служебные токены <|im_start|>: через BPE такой текст распадается на
+# обычные куски, и модель не видит границ реплик.
+SPECIALBIN := $(BIN)/tok_special
 LITE    := $(BIN)/dcd-lite
 
 # lite: то же самое, что dcd, но с маленькими буферами и -Os.
@@ -51,9 +54,14 @@ LITEFLAGS := -Os -ffunction-sections -fdata-sections \
 
 # Custom includes (for extra flags/rules)
 -include *.mk
-.PHONY: all clean run-example config test lite size
+.PHONY: all clean distclean run-example config test lite size
 
-all: $(TARGETS) $(TESTBIN) $(QUANTBIN) $(QUANTREAL) lite
+all: $(TARGETS) $(TESTBIN) $(QUANTBIN) $(QUANTREAL) $(SPECIALBIN) lite
+
+$(SPECIALBIN): $(BUILD)/tok.o $(BUILD)/gguf.o $(BUILD)/util.o \
+               tests/tok_special.c | $(BIN)
+	$(CC) $(CFLAGS) $(LDFLAGS) -I$(SRC) -o $@ tests/tok_special.c \
+	      $(BUILD)/tok.o $(BUILD)/gguf.o $(BUILD)/util.o $(LDLIBS)
 
 $(QUANTBIN): $(BUILD)/gguf.o $(BUILD)/util.o tests/quant_test.c | $(BIN)
 	$(CC) $(CFLAGS) $(LDFLAGS) -I$(SRC) -o $@ tests/quant_test.c \
@@ -107,6 +115,7 @@ lite-size-bytes: $(LITE)
 
 # автозависимости по заголовкам
 $(QUANTBIN) $(QUANTREAL): $(SRC)/gguf.h $(SRC)/util.h
+$(SPECIALBIN): $(SRC)/tok.h $(SRC)/gguf.h $(SRC)/util.h
 $(BUILD)/util.o:    $(SRC)/util.h
 $(BUILD)/json.o:    $(SRC)/json.h  $(SRC)/util.h
 $(BUILD)/conf.o:    $(SRC)/conf.h  $(SRC)/util.h
@@ -138,5 +147,15 @@ run-example: all
 test: all
 	@./scripts/test.sh
 
+# clean убирает только то, что сам же и собрал: объекты и бинарники.
+# Модели и конфигурация рядом не трогаются — раньше здесь стояло
+# «rm -rf build bin», и одна команда clean стирала скачанную модель
+# на полгигабайта, которую заново приходилось качать с сети.
 clean:
+	rm -rf $(BUILD)
+	rm -f $(BIN)/dcctl $(BIN)/dcd $(BIN)/dcd-lite
+	rm -f $(BIN)/expr_test $(BIN)/quant_test $(BIN)/quant_real $(BIN)/gen_test
+	rm -f $(BIN)/dump_test $(BIN)/engine_test $(BIN)/tok_special $(BIN)/llm_tokens
+
+distclean: clean
 	rm -rf $(BUILD) $(BIN)

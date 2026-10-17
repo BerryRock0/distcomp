@@ -46,6 +46,15 @@ int dc_infer_layout(dc_config *cfg, const char *model_path, const dc_infer_opts 
 char *dc_infer_generate(dc_infer *in, const char *prompt, int max_new,
                         char *err, size_t errlen);
 
+/* На каждый новый токен вызывается cb с его id и куском текста (только тем,
+ * что ещё не отдавали). cb возвращает 0, чтобы остановить генерацию.
+ * Нужен веб-чату: ответ показывают по мере поступления, а не после конца.
+ * Полный ответ возвращается в любом случае. */
+typedef int (*dc_tok_cb)(int tok, const char *text, void *ud);
+
+char *dc_infer_generate_cb(dc_infer *in, const char *prompt, int max_new,
+                           dc_tok_cb cb, void *ud, char *err, size_t errlen);
+
 /* Сколько токенов контекста занял последний вызов generate. */
 int dc_infer_used(const dc_infer *in);
 
