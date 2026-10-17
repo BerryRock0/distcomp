@@ -27,6 +27,12 @@ ALL_OBJ := $(COMMON_OBJ) $(CTL_OBJ) $(DAEMON_OBJ)
 
 TARGETS := $(BIN)/dcctl $(BIN)/dcd
 TESTBIN := $(BIN)/expr_test
+# Деквантизация против эталона ggml. tests/dequant_test проверяет правдоподобность
+# (нет NaN, разброс в разумных пределах) — этого недостаточно: переставленные
+# веса остаются числами того же порядка, и неверная раскладка блока проходит
+# незаметно. Здесь сравниваются все 256 весов блока с эталоном.
+QUANTBIN := $(BIN)/quant_test
+QUANTREAL := $(BIN)/quant_real
 LITE    := $(BIN)/dcd-lite
 
 # lite: то же самое, что dcd, но с маленькими буферами и -Os.
@@ -47,7 +53,18 @@ LITEFLAGS := -Os -ffunction-sections -fdata-sections \
 -include *.mk
 .PHONY: all clean run-example config test lite size
 
-all: $(TARGETS) $(TESTBIN) lite
+all: $(TARGETS) $(TESTBIN) $(QUANTBIN) $(QUANTREAL) lite
+
+$(QUANTBIN): $(BUILD)/gguf.o $(BUILD)/util.o tests/quant_test.c | $(BIN)
+	$(CC) $(CFLAGS) $(LDFLAGS) -I$(SRC) -o $@ tests/quant_test.c \
+	      $(BUILD)/gguf.o $(BUILD)/util.o $(LDLIBS)
+
+# blocks.bin снимает scripts/dump_blocks.py: настоящие блоки из модели плюс
+# значения ggml. Нужен python3 с пакетом gguf; без него цель просто не
+# собирается, и test.sh этот сценарий пропускает.
+$(QUANTREAL): $(BUILD)/gguf.o $(BUILD)/util.o tests/quant_real.c | $(BIN)
+	$(CC) $(CFLAGS) $(LDFLAGS) -I$(SRC) -o $@ tests/quant_real.c \
+	      $(BUILD)/gguf.o $(BUILD)/util.o $(LDLIBS)
 
 $(BUILD) $(BIN):
 	@mkdir -p $@
@@ -89,6 +106,7 @@ lite-size-bytes: $(LITE)
 	@echo "текст lite-узла: $$(stat -c%s $(LITE)) байт (включая libc)"
 
 # автозависимости по заголовкам
+$(QUANTBIN) $(QUANTREAL): $(SRC)/gguf.h $(SRC)/util.h
 $(BUILD)/util.o:    $(SRC)/util.h
 $(BUILD)/json.o:    $(SRC)/json.h  $(SRC)/util.h
 $(BUILD)/conf.o:    $(SRC)/conf.h  $(SRC)/util.h

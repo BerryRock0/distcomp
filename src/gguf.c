@@ -229,7 +229,9 @@ static void read_meta(gguf_file *g, rd *r, size_t n)
     }
 }
 
-int gguf_open(gguf_file *g, const void *file, size_t size, char *err, size_t errlen)
+/* head_only: читаем начало файла и не требуем, чтобы веса в него попали. */
+static int gguf_open_impl(gguf_file *g, const void *file, size_t size,
+                          int head_only, char *err, size_t errlen)
 {
     memset(g, 0, sizeof *g);
     g->file = file;
@@ -311,6 +313,11 @@ int gguf_open(gguf_file *g, const void *file, size_t size, char *err, size_t err
     for (size_t i = 0; i < g->n_tensors; i++) {
         gguf_tensor *t = &g->tensors[i];
         if (t->off > size || base + t->off + t->nbytes > size) {
+            /* В префиксе файла веса заведомо нет — читателю они и не нужны,
+             * нужен только заголовок со словарём. Молча оставляем такой тензор
+             * без данных: читатель слов его и не запросит, а gguf_open на
+             * целом файле по-прежнему отвергает обрезанный файл. */
+            if (head_only) { t->data = NULL; continue; }
             snprintf(err, errlen, "тензор %s выходит за пределы файла", t->name);
             goto fail;
         }
@@ -321,6 +328,16 @@ int gguf_open(gguf_file *g, const void *file, size_t size, char *err, size_t err
 fail:
     gguf_close(g);
     return -1;
+}
+
+int gguf_open(gguf_file *g, const void *file, size_t size, char *err, size_t errlen)
+{
+    return gguf_open_impl(g, file, size, 0, err, errlen);
+}
+
+int gguf_open_head(gguf_file *g, const void *file, size_t size, char *err, size_t errlen)
+{
+    return gguf_open_impl(g, file, size, 1, err, errlen);
 }
 
 void gguf_close(gguf_file *g)
@@ -468,85 +485,69 @@ static float rd_f16(const unsigned char *p)
     return out;
 }
 
-/* Q2_K: 84 байта на 256 весов. По 4 бита на масштаб в scales[16],
- * по 2 бита на вес в qs[64]. Порядок полей: scales, qs, d, dmin — d лежит
- * на 80-м байте, а не на 64-м (там ещё не конец qs). */
+/* Q2_K: 84 байта на 256 весов. Порядок полей: scales[16], qs[64], d, dmin.
+ * 16 масштабов по 16 весов; один байт qs обслуживает два соседних масштаба
+ * (младший и старший ниббл), сдвиг для группы g равен 2*(g/2).
+ *
+ * Раньше здесь читался один байт qs на четыре группы и брался сдвиг j*4:
+ * веса внутри блока вставали на места попарно, и 82 веса из 128 в блоке
+ * выходили с чужой парой «масштаб — мин». Снаружи это не видно: значения
+ * правдоподобны, нет ни NaN, ни выбросов — но Q/K и FFN после этого
+ * считаются по переставленным весам, и модель повторяет промпт. */
 static void deq_q2_K(const unsigned char *x, float *y, int nb)
 {
     for (int i = 0; i < nb; i++, x += 84, y += QK_K) {
-        const float d = rd_f16(x + 80);
-        const float mn = rd_f16(x + 82);
-        const unsigned char *sc = x;
-        const unsigned char *qs = x + 16;
-        int is = 0;
-        for (int n = 0; n < QK_K; n += 128) {
-            for (int j = 0; j < 4; j++) {
-                /* На каждую половину блока приходится два байта qs:
-                 * j=0,1 читают первый, j=2,3 — второй. Раньше брался один
-                 * байт на все четыре группы, и веса внутри блока вставали
-                 * на места попарно — снаружи это не видно, но Q/K и FFN
-                 * после этого считались по переставленным весам. */
-                unsigned char q = qs[n / 128 + (j >= 2 ? 1 : 0)];
-                int shift = j * 4;
-                unsigned char s1 = sc[is++];
-                float d1 = d * (s1 & 0xF), m1 = mn * (s1 >> 4);
-                for (int l = 0; l < 16; l++) y[n + j * 32 + l] = d1 * ((q >> shift) & 3) - m1;
-                unsigned char s2 = sc[is++];
-                float d2 = d * (s2 & 0xF), m2 = mn * (s2 >> 4);
-                for (int l = 0; l < 16; l++)
-                    y[n + j * 32 + 16 + l] = d2 * ((q >> (shift + 2)) & 3) - m2;
-            }
+        const float d = rd_f16(x + 80), mn = rd_f16(x + 82);
+        for (int g = 0; g < 16; g++) {
+            int   c  = g / 8, j = (g / 2) % 4, sh = 2 * j;
+            int   b0 = c * 32 + (g % 2) * 16;
+            float dl = d * (float)(x[g] & 0xF);
+            float ml = mn * (float)(x[g] >> 4);
+            for (int k = 0; k < 16; k++)
+                y[g * 16 + k] = dl * (float)((x[16 + b0 + k] >> sh) & 3) - ml;
         }
     }
 }
 
-/* Q3_K: 110 байт. 3 бита на вес: младшие два в qs[64], старший бит в
- * hmask[32]. Масштабы 6 бит, упакованы по 4 штуки в байт (12 байт). */
+/* Q3_K: 110 байт. Старший бит веса лежит в hmask[32], два младших — в
+ * qs[64]; 16 масштабов по 6 бит в scales[12] и общий множитель d.
+ *
+ * Нумерация весов здесь переплетена: у блока 16 групп по 16 весов, а байты
+ * qs и hmask адресуются не «по группе», а через перестановку reshape в
+ * эталоне ggml. Раньше здесь стояло чтение qs[c*32 + j] — один байт на две
+ * группы — и hmask[g/2]; из-за этого вес брался не оттуда и 488 весов из
+ * 512 выходили неверными: на файлах с Q3_K (attn_output, ffn_down) модель
+ * повторяла промпт и зацикливалась на одном токене.
+ *
+ * Для веса l группы j (0..15) эталон берёт:
+ *   младшие 2 бита: (qs[(j/8)*32 + (j%2)*16 + l] >> 2*((j/2)%4)) & 3
+ *   старший бит:    (hmask[(j%2)*16 + l] >> (j/2)) & 1
+ * и вычитает из младших битов (старший ^ 1) << 2 — то есть установленный
+ * бит означает «вычесть 4», а не «вычесть 0». */
 static void deq_q3_K(const unsigned char *x, float *y, int nb)
 {
-    static const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
     for (int i = 0; i < nb; i++, x += 110, y += QK_K) {
-        const float d = rd_f16(x + 108);
-        const unsigned char *hmask = x;
+        const unsigned char *hm = x;
         const unsigned char *qs = x + 32;
-        const unsigned char *scraw = x + 96;
+        const unsigned char *sc = x + 96;
+        const float d = rd_f16(x + 108);
 
-        uint32_t aux[4];
-        memcpy(aux, scraw, 12);
-        uint32_t tmp = aux[2];
-        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        for (int j = 0; j < 16; j++) {
+            /* 6 бит масштаба: младшие 4 — из байтов 0..7 (ниблы), старшие 2 —
+             * из байтов 8..11. Индекс и сдвиг здесь идут по разным сторонам:
+             * байт выбирается остатком j%4, сдвиг — частным j/4. */
+            int   lo = (int)(sc[j & 7] >> (4 * (j >> 3))) & 0x0F;
+            int   hi = (int)(sc[8 + (j & 3)] >> (2 * (j >> 2))) & 0x03;
+            float dl = d * (float)((lo | (hi << 4)) - 32);
 
-        /* Масштабов восемь, а не четыре: в каждой половине блока по четыре
- * группы по 32 веса. Обращение к dl[2+j] при массиве из четырёх элементов
- * уезжало за пределы и давало значения порядка миллиона. */
-        int8_t ls[8];
-        float  dl[8];
-        for (int j = 0; j < 4; j++) {
-            int v = (int)(aux[j] & 0xF) | (int)(((j < 2 ? aux[j] : aux[j - 2]) >> 4) & 0x3) << 4;
-            ls[j] = (int8_t)(v - 32);
-            dl[j] = d * (float)ls[j];
-            int v2 = (int)(aux[j + 4] & 0xF) |
-                     (int)(((j < 2 ? aux[j + 4] : aux[j + 2]) >> 4) & 0x3) << 4;
-            ls[j + 4] = (int8_t)(v2 - 32);
-            dl[j + 4] = d * (float)ls[j + 4];
-        }
+            int                     sh = 2 * ((j >> 1) & 3);   /* сдвиг внутри qs */
+            const unsigned char *qp = qs + (j >> 3) * 32 + (j & 1) * 16;
+            const unsigned char *hp = hm + (j & 1) * 16;
 
-        unsigned m = 1;
-        for (int n = 0; n < QK_K; n += 128) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                float dl0 = dl[j], dl1 = dl[2 + j];
-                for (int l = 0; l < 16; l++) {
-                    int q0 = (qs[n / 128 * 32 + l] >> shift) & 3;
-                    int q1 = (qs[n / 128 * 32 + l + 16] >> shift) & 3;
-                    y[n + j * 32 + l] = dl0 * (q0 - ((hmask[n / 128 * 32 + l] & m) ? 0 : 4));
-                    y[n + j * 32 + 16 + l] = dl1 * (q1 - ((hmask[n / 128 * 32 + l + 16] & m) ? 0 : 4));
-                }
-                shift += 2;
-                m <<= 1;
+            for (int l = 0; l < 16; l++) {
+                int q2 = (qp[l] >> sh) & 3;
+                int b3 = ((hp[l] >> (j >> 1)) & 1) ^ 1;
+                y[j * 16 + l] = dl * (float)(q2 - (b3 << 2));
             }
         }
     }
@@ -614,29 +615,32 @@ static void deq_q5_K(const unsigned char *x, float *y, int nb)
 }
 
 /* Q6_K: 210 байт. 4 младших бита в ql[128], 2 старших в qh[64],
- * 16 масштабов int8 и общий f16. */
+ * 16 масштабов int8 и общий множитель d.
+ *
+ * Веса разложены перестановкой reshape, поэтому адрес выводится из номера
+ * веса, а не наоборот. Для веса idx в группе масштабов g (16 весов на
+ * группу, всего 256):
+ *   row = idx/32, c = idx%32 — строка свёрнутого массива (8 на 32);
+ *   младшие 4 бита: ql[(row/4)*64 + (row%2)*32 + c] >> (4*((row/2)%2));
+ *   старшие 2 бита: qh[(row/4)*32 + c]          >> (2*(row%4));
+ *   масштаб — sc[g]: 16 масштабов на 256 весов, а не по одному на половину.
+ *
+ * Раньше брался ql[c*64+k] и qh[c2*32+k] при k<16, то есть вторая
+ * половина блока не адресовалась вовсе: на output.weight — то есть на
+ * самой голове модели — логиты выходили полностью неверными. */
 static void deq_q6_K(const unsigned char *x, float *y, int nb)
 {
     for (int i = 0; i < nb; i++, x += 210, y += QK_K) {
+        const unsigned char *ql = x, *qh = x + 128;
+        const signed char   *sc = (const signed char *)(const void *)(x + 192);
         const float d = rd_f16(x + 208);
-        const unsigned char *ql = x;
-        const unsigned char *qh = x + 128;
-        const signed char *sc = (const signed char *)(const void *)(x + 192);
-        for (int n = 0; n < QK_K; n += 128) {
-            for (int l = 0; l < 32; l++) {
-                int is = l / 16;
-                int8_t q1 = (int8_t)((ql[n / 128 * 64 + l] & 0xF) |
-                                     (((qh[l] >> 0) & 3) << 4)) - 32;
-                int8_t q2 = (int8_t)((ql[n / 128 * 64 + l + 32] & 0xF) |
-                                     (((qh[l] >> 2) & 3) << 4)) - 32;
-                int8_t q3 = (int8_t)((ql[n / 128 * 64 + l] >> 4) |
-                                     (((qh[l] >> 4) & 3) << 4)) - 32;
-                int8_t q4 = (int8_t)((ql[n / 128 * 64 + l + 32] >> 4) |
-                                     (((qh[l] >> 6) & 3) << 4)) - 32;
-                y[n + l]      = d * sc[is + 0] * q1;
-                y[n + l + 32] = d * sc[is + 2] * q2;
-                y[n + 64 + l] = d * sc[is + 4] * q3;
-                y[n + 96 + l] = d * sc[is + 6] * q4;
+
+        for (int g = 0; g < 16; g++) {
+            for (int p = 0; p < 16; p++) {
+                int idx = g * 16 + p, row = idx / 32, c = idx % 32;
+                int lo = (ql[(row / 4) * 64 + (row % 2) * 32 + c] >> (4 * ((row / 2) % 2))) & 0x0F;
+                int hi = (qh[(row / 4) * 32 + c] >> (2 * (row % 4))) & 0x03;
+                y[idx] = d * (float)sc[g] * (float)((lo | (hi << 4)) - 32);
             }
         }
     }
