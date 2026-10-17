@@ -34,15 +34,24 @@ VERSION = 3          # в третьей версии длины строк и �
 HEADER = struct.Struct('<IIQQ')
 
 
+# Длины строк и массивов — ВСЕГДА uint64, и в v2, и в v3. В третьей версии
+# изменился не размер поля длины, а кое-что другое; настоящие файлы от
+# llama.cpp (Qwen2.5 и другие) пишут длину ключа восемью байтами.
+#
+# Раньше здесь стояло «в v3 — uint32». Из-за этого эталонная модель писалась
+# в формате, который не читает ни наш движок, ни llama.cpp: разбор уезжал на
+# четыре байта и упирался в «строка длиннее файла». Модель была нечитаемой,
+# и сценарии «разложение по узлам» и «сверка конвейера» падали на файле,
+# который сама же генератор и создавал.
+
+
 def w_str(s):
     b = s.encode('utf-8')
-    if VERSION >= 3:
-        return struct.pack('<I', len(b)) + b
     return struct.pack('<Q', len(b)) + b
 
 
 def w_alen(n):
-    return struct.pack('<I', n) if VERSION >= 3 else struct.pack('<Q', n)
+    return struct.pack('<Q', n)
 
 
 def w_value(vtype, val):
@@ -219,8 +228,22 @@ def forward(m, tokens):
     n_rep = nh // nkv
 
     def W(name):
+        """Матрица веса в виде, в каком ggml их читает: [ne1, ne0].
+
+        В файле элемент (i0, i1) стоит по адресу i0 + i1*ne0, то есть
+        непрерывное измерение ne0 — это вход. Поэтому плоский буфер читается
+        как [ne1, ne0], и y = W @ x уже есть matvec, без транспонирования.
+
+        Раньше здесь стояло reshape(shape), то есть [ne0, ne1] с шагом ne1, и
+        дальше каждое умножение компенсировалось .T. Для квадратных весов это
+        выглядело верно, а для неквадратных (эмбеддинги, ffn) — нет: строка
+        бралась не оттуда, и модель получала вход из чужих элементов.
+        """
         shape, data = m.tensors[name]
-        return np.array(data, dtype=np.float32).reshape(shape)
+        a = np.array(data, dtype=np.float32)
+        if len(shape) == 1:
+            return a                     # вектор (нормы): транспонировать нечего
+        return a.reshape(shape[1], shape[0])
 
     def rope(vec, pos):
         out = vec.copy()
@@ -232,14 +255,16 @@ def forward(m, tokens):
         out[half:half * 2] = vec[half:half * 2] * c + vec[:half] * s
         return out
 
-    x = W('token_embd.weight')[:, tokens]            # [ne, T]
+    # Токены идут в эмбеддингах вплотную блоками по n_embd: строка t стоит по
+    # адресу t*ne. W отдаёт [n_vocab, ne], так что нужна строка, а не столбец.
+    x = W('token_embd.weight')[tokens].T             # [ne, T]
     T = x.shape[1]
 
     for i in range(m.n_layer):
         h = rms_norm(x, W('blk.%d.attn_norm.weight' % i), m.rms_eps)
-        q = (W('blk.%d.attn_q.weight' % i).T @ h).reshape(nh, hd, T)
-        k = (W('blk.%d.attn_k.weight' % i).T @ h).reshape(nkv, hd, T)
-        v = (W('blk.%d.attn_v.weight' % i).T @ h).reshape(nkv, hd, T)
+        q = (W('blk.%d.attn_q.weight' % i) @ h).reshape(nh, hd, T)
+        k = (W('blk.%d.attn_k.weight' % i) @ h).reshape(nkv, hd, T)
+        v = (W('blk.%d.attn_v.weight' % i) @ h).reshape(nkv, hd, T)
 
         out = np.zeros((nh, hd, T), dtype=np.float32)
         for g in range(nh):
@@ -262,16 +287,16 @@ def forward(m, tokens):
                 out[g, :, t] = acc
 
         merged = out.reshape(nh * hd, T)
-        x = x + W('blk.%d.attn_output.weight' % i).T @ merged
+        x = x + W('blk.%d.attn_output.weight' % i) @ merged
 
         h = rms_norm(x, W('blk.%d.ffn_norm.weight' % i), m.rms_eps)
-        gate = W('blk.%d.ffn_gate.weight' % i).T @ h
-        up = W('blk.%d.ffn_up.weight' % i).T @ h
+        gate = W('blk.%d.ffn_gate.weight' % i) @ h
+        up = W('blk.%d.ffn_up.weight' % i) @ h
         act = (gate / (1.0 + np.exp(-gate))) * up                 # SwiGLU
-        x = x + W('blk.%d.ffn_down.weight' % i).T @ act
+        x = x + W('blk.%d.ffn_down.weight' % i) @ act
 
     xf = rms_norm(x[:, -1:], W('output_norm.weight'), m.rms_eps)[:, 0]
-    return W('output.weight').T @ xf
+    return W('output.weight') @ xf
 
 
 def main():
