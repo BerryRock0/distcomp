@@ -460,6 +460,103 @@ static dc_infer *open_infer(const dc_config *cfg, const char *goal, char *err, s
     return NULL;
 }
 
+/* ----------------------------------------------------------------- чат --- */
+/*
+ * Та же модель и то же разложение, но работает человек, а не план. Поэтому
+ * системный промпт здесь другой, а контекста нужно больше: разговор длиннее
+ * одной задачи, и модель должна видеть предыдущие реплики.
+ */
+
+const char *llm_chat_system(const dc_config *cfg)
+{
+    if (cfg->chat_system && *cfg->chat_system) return cfg->chat_system;
+    return "Ты — помощник. Отвечай по-русски, кратко и по делу. "
+           "Если вопрос вычислимый, считай прямо в ответе.";
+}
+
+/* Промпт в формате ChatML — так его понимают Qwen2 и Llama-3.
+ * history уже готовые реплики, каждая «роль» + «текст» + перевод строки. */
+char *llm_chat_prompt(const char *system, const char *history, const char *message)
+{
+    strbuf b;
+    sb_init(&b);
+    sb_add(&b, "<|im_start|>system\n");
+    sb_add(&b, system && *system ? system : "");
+    sb_add(&b, "<|im_end|>\n");
+    if (history && *history) {
+        sb_add(&b, history);
+    }
+    sb_add(&b, "<|im_start|>user\n");
+    sb_add(&b, message && message[0] ? message : "");
+    sb_add(&b, "<|im_end|>\n<|im_start|>assistant\n");
+    return b.p;
+}
+
+void llm_chat_history_add(strbuf *hist, const char *role, const char *text)
+{
+    sb_add(hist, "<|im_start|>");
+    sb_add(hist, role);
+    sb_add(hist, "\n");
+    sb_add(hist, text && text[0] ? text : "");
+    sb_add(hist, "<|im_end|>\n");
+}
+
+/* Открывает конвейер под чат. Отличие от планирования в том, сколько места
+ * заказывается узлам: там хватает системного промпта и одной задачи, здесь
+ * нужны ещё история разговора и длинный ответ. */
+dc_infer *llm_open_chat(dc_config *cfg, int max_new, char *err, size_t errlen)
+{
+    const char *model = cfg->model_file;
+    if (!model || !*model) {
+        snprintf(err, errlen,
+                 "не задана модель: укажите model_file в секции [llm] — путь к GGUF-файлу");
+        return NULL;
+    }
+    if (max_new <= 0) max_new = cfg->max_new > 0 ? cfg->max_new : 512;
+
+    /* Прикидка объёма: системный промпт плюс история плюс ответ. Считаем по
+     * токенизатору, а не «три знака на токен» — у модели со словарём в 256
+     * слов каждый знак это токен, и оценка врала бы в семь раз. */
+    char *sys   = xstrdup(llm_chat_system(cfg));
+    char *probe = llm_chat_prompt(sys, "", "");
+    int   ntok  = 0;
+    char  terr[512] = {0};
+    if (llm_model_tokens(model, probe, &ntok, terr, sizeof terr) != 0) {
+        snprintf(err, errlen, "%s", terr);
+        free(sys); free(probe);
+        return NULL;
+    }
+    free(probe);
+
+    int history_msgs = cfg->chat_history > 0 ? cfg->chat_history : 8;
+    /* на каждую сохранённую реплику закладываем 200 токенов — это с запасом
+     * покрывает обычую реплику и не заказывает узлам лишней памяти */
+    int need = ntok + history_msgs * 200 + max_new + 8;
+    log_info("чат: промпт %d токенов, история %d реплик, ответ до %d, нужно контекста %d",
+             ntok, history_msgs, max_new, need);
+
+    if (need > DC_PLAN_CTX_MAX) need = DC_PLAN_CTX_MAX;
+    if (cfg->n_ctx > 0) need = cfg->n_ctx;
+
+    char err2[512] = {0};
+    for (int i = 0; i < 2; i++) {
+        int n_ctx = need;
+        if (i) n_ctx = need / 2;
+        if (n_ctx < ntok + 8) continue;
+        dc_infer      *in = NULL;
+        dc_infer_opts  o  = { .n_ctx = n_ctx, .verbose = 0 };
+        if (dc_infer_open(cfg, model, &o, &in, err2, sizeof err2) == 0) {
+            free(sys);
+            if (i) log_info("узлы не тянут контекст %d, беру %d", need, n_ctx);
+            return in;
+        }
+        log_debug("разкладка с контекстом %d не вышла: %s", n_ctx, err2);
+    }
+    free(sys);
+    snprintf(err, errlen, "модель не разложилась по узлам: %s", err2);
+    return NULL;
+}
+
 char *llm_make_plan(const dc_config *cfg, const char *goal, int use_llm, int allow_fallback,
                     char *err, size_t errlen)
 {

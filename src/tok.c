@@ -201,6 +201,26 @@ int llm_tok_open(llm_tok *t, const gguf_file *g, char *err, size_t errlen)
     t->map_val = xmalloc(cap * sizeof *t->map_val);
     for (size_t i = 0; i < t->n_tokens; i++) map_put(t, t->tokens[i], (int)i);
 
+    /* Служебные токены: то, что записано в словаре в виде <|…|>.
+     *
+     * Такие токены не проходят через BPE: обычный разбор режет «<|im_end|>»
+     * на «<», «|», «im», «_end», «|», «>», и модель получает вместо
+     * разделителя реплик обычный текст. Из-за этого она не доходит до конца
+     * ответа и продолжает разговор сама с собой. */
+    t->spec_str = xcalloc(64, sizeof *t->spec_str);
+    t->spec_id  = xcalloc(64, sizeof *t->spec_id);
+    t->spec_n   = 0;
+    for (size_t i = 0; i < t->n_tokens && t->spec_n < 64; i++) {
+        const char *s = t->tokens[i];
+        if (!s) continue;
+        size_t l = strlen(s);
+        if (l < 5 || l > 64) continue;            /* «<|x|>» — самый короткий */
+        if (s[0] != '<' || s[1] != '|' || s[l - 1] != '>' || s[l - 2] != '|') continue;
+        t->spec_str[t->spec_n] = s;
+        t->spec_id[t->spec_n]  = (int)i;
+        t->spec_n++;
+    }
+
     /* слияния: обе половины ищем в словаре, результат — тоже в словаре.
  * Идентификатор склеенного токена не выводится из номера слияния: он
  * лежит в tokens по тем же правилам, что и все остальные. */
@@ -245,6 +265,8 @@ void llm_tok_close(llm_tok *t)
     free(t->merges);
     free(t->map_key);
     free(t->map_val);
+    free(t->spec_str);
+    free(t->spec_id);
     free(t->mg_key);
     free(t->mg_rank);
     free(t->mg_id);
@@ -377,14 +399,13 @@ static int bpe_encode(const llm_tok *t, const char *text, int *out, int max_out,
     return k;
 }
 
-int llm_tok_encode(const llm_tok *t, const char *text, int *out, int max_out, char *err,
-                   size_t errlen)
+/* Обычный текст без служебных токенов: прежний путь целиком. */
+static int encode_plain(const llm_tok *t, const char *text, int *out, int max_out,
+                        char *err, size_t errlen)
 {
-    if (!t || !text || !out || max_out <= 0) return -1;
+    if (max_out <= 0 || !*text) return 0;
 
     int ntok = 0;
-    if (t->add_bos && t->bos_id > 0) out[ntok++] = t->bos_id;
-
     if (t->style_gpt2) {
         char *pieces[2048];
         int np = pretokenize(text, pieces, (int)(sizeof pieces / sizeof pieces[0]));
@@ -430,6 +451,67 @@ int llm_tok_encode(const llm_tok *t, const char *text, int *out, int max_out, ch
         }
         sb_free(&b);
     }
+    return ntok;
+}
+
+/* Служебный токен, начинающийся в p: самый длинный из известных. */
+static int spec_at(const llm_tok *t, const char *p, size_t *len_out)
+{
+    int    best = -1;
+    size_t best_len = 0;
+    for (size_t i = 0; i < t->spec_n; i++) {
+        size_t l = strlen(t->spec_str[i]);
+        if (l > best_len && strncmp(p, t->spec_str[i], l) == 0) {
+            best_len = l;
+            best = t->spec_id[i];
+        }
+    }
+    if (best >= 0 && len_out) *len_out = best_len;
+    return best;
+}
+
+/* Текст -> идентификаторы.
+ *
+ * Служебные токены вида <|im_start|> вылавливаются из текста напрямую и
+ * кодируются как есть: через BPE такой текст распадается на обычные куски,
+ * и модель не видит разделителей реплик. Остальное кодируется как прежде. */
+int llm_tok_encode(const llm_tok *t, const char *text, int *out, int max_out, char *err,
+                   size_t errlen)
+{
+    if (!t || !text || !out || max_out <= 0) return -1;
+
+    int ntok = 0;
+    if (t->add_bos && t->bos_id > 0 && ntok < max_out) out[ntok++] = t->bos_id;
+
+    strbuf plain;
+    sb_init(&plain);
+    const char *seg = text;
+    const char *p   = text;
+
+    while (*p && ntok < max_out) {
+        size_t slen = 0;
+        int    sid  = t->spec_n ? spec_at(t, p, &slen) : -1;
+        if (sid < 0) { p++; continue; }
+
+        if (p > seg) sb_addn(&plain, seg, (size_t)(p - seg));
+        if (plain.len) {
+            int got = encode_plain(t, plain.p, out + ntok, max_out - ntok, err, errlen);
+            if (got < 0) { sb_free(&plain); return -1; }
+            ntok += got;
+            sb_free(&plain);
+            sb_init(&plain);
+        }
+        if (ntok < max_out) out[ntok++] = sid;
+        p  += slen;
+        seg = p;
+    }
+    if (p > seg) sb_addn(&plain, seg, (size_t)(p - seg));
+    if (plain.len) {
+        int got = encode_plain(t, plain.p, out + ntok, max_out - ntok, err, errlen);
+        if (got < 0) { sb_free(&plain); return -1; }
+        ntok += got;
+    }
+    sb_free(&plain);
 
     if (t->add_eos && t->eos_id > 0 && ntok < max_out) out[ntok++] = t->eos_id;
     return ntok;

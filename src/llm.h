@@ -2,6 +2,8 @@
 #define DC_LLM_H
 
 #include "conf.h"
+#include "shard.h"
+#include "util.h"
 
 #include <stddef.h>
 
@@ -30,6 +32,26 @@ char *llm_make_plan(const dc_config *cfg, const char *goal, int use_llm,
 char *llm_heuristic_plan(const dc_config *cfg, const char *goal);
 
 const char *llm_system_prompt(const dc_config *cfg);
+
+/* ----------------------------------------------------------------- чат --- */
+/*
+ * Веб-чат: та же модель и то же разложение по узлам, но системный промпт
+ * другой (здесь модель отвечает человеку, а не строит план) и контекста
+ * заказывается больше — разговор длиннее одной задачи.
+ */
+
+const char *llm_chat_system(const dc_config *cfg);
+
+/* Промпт в формате ChatML (его понимают Qwen2 и Llama-3). history — уже
+ * готовые реплики, каждая оформлена как «<|im_start|>роль\nтекст<|im_end|>». */
+char *llm_chat_prompt(const char *system, const char *history, const char *message);
+
+/* Дописать реплику в историю. */
+void llm_chat_history_add(strbuf *hist, const char *role, const char *text);
+
+/* Открыть конвейер под чат. Отличается от open_infer только объёмом
+ * контекста: системный промпт, история разговора и длинный ответ. */
+dc_infer *llm_open_chat(dc_config *cfg, int max_new, char *err, size_t errlen);
 
 /* ---------------------------------------------------------- проверка --- */
 

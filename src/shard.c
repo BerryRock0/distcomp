@@ -816,6 +816,31 @@ static int infer_reset(dc_infer *in, char *err, size_t errlen)
 char *dc_infer_generate(dc_infer *in, const char *prompt, int max_new,
                         char *err, size_t errlen)
 {
+    return dc_infer_generate_cb(in, prompt, max_new, NULL, NULL, err, errlen);
+}
+
+/* Граница UTF-8 в накопленном тексте: у BPE один токен — это байт или часть
+ * многобайтного знака, поэтому последний токен иногда неполон, и отдавать его
+ * в браузер рано. Возвращает длину безопасного префикса. */
+static size_t utf8_safe(const char *s, size_t n)
+{
+    if (!n) return 0;
+    /* идём от конца к началу последнего знака */
+    size_t i = n;
+    while (i > 0 && ((unsigned char)s[i - 1] & 0xC0) == 0x80) i--;
+    if (i == 0) return 0;                       /* хвост без начала — ждём */
+    unsigned char lead = (unsigned char)s[i - 1];
+    size_t need = lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+    return (n - i + 1) >= need ? n : i - 1;
+}
+
+/* Генерация с потоком: на каждый новый токен вызывается cb с его текстом.
+ * cb возвращает 0, чтобы остановиться; если cb нет, токены просто копятся.
+ * Весь ответ собирается и возвращается в любом случае — планировщику он и
+ * нужен целиком. */
+char *dc_infer_generate_cb(dc_infer *in, const char *prompt, int max_new,
+                           dc_tok_cb cb, void *ud, char *err, size_t errlen)
+{
     if (!in || !prompt) {
         snprintf(err, errlen, "конвейер не открыт");
         return NULL;
@@ -873,11 +898,32 @@ char *dc_infer_generate(dc_infer *in, const char *prompt, int max_new,
     int  ngen  = 0;
     int  token = nid > 0 ? next : 0;
 
+    /* уже отданный в поток текст: с каждым токеном отдаём только продолжение */
+    size_t sent = 0;
+    char  *acc  = xmalloc(1);
+    acc[0] = '\0';
+
     for (int i = 0; i < max_new; i++) {
         if (token == eos) break;
         gen[ngen++] = token;
+        if (cb) {
+            /* пересобираем весь ответ: разбор BPE может «дописать» знак,
+             * поэтому кусок считаем от конца, а не от текущего токена */
+            free(acc);
+            size_t cap = (size_t)ngen * 8 + 64;
+            acc = xmalloc(cap);
+            llm_tok_decode(&in->m.tok, gen, ngen, acc, cap);
+            size_t have = strlen(acc);
+            size_t upto = utf8_safe(acc, have);
+            if (upto > sent) {
+                int cont = cb(token, acc + sent, ud);
+                sent = upto;
+                if (!cont) break;
+            }
+        }
         next = pipe_step(&P, token, err, errlen);
         if (next < 0) {
+            free(acc);
             free(gen);
             return NULL;
         }
@@ -890,6 +936,7 @@ char *dc_infer_generate(dc_infer *in, const char *prompt, int max_new,
     size_t cap = (size_t)ngen * 8 + 64;
     char  *text = xmalloc(cap);
     llm_tok_decode(&in->m.tok, gen, ngen, text, cap);
+    free(acc);
     free(gen);
     return text;
 }

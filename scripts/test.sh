@@ -166,6 +166,18 @@ else
   echo "  пропущено: нужны пакет gguf и модель в DC_QUANT_MODEL"
 fi
 
+# Служебные токены: без них модель не видит границ реплик и продолжает
+# разговор сама с собой. Проверка берёт настоящий файл, а не синтетику.
+if [ -n "${DC_TOK_MODEL:-}" ] && [ -f "${DC_TOK_MODEL}" ]; then
+  if ./bin/tok_special "$DC_TOK_MODEL" > "$T/tok_special.txt" 2>&1; then
+    ok "служебные токены кодируются как есть"
+  else
+    bad "служебные токены" "$(cat "$T/tok_special.txt")"
+  fi
+else
+  echo "  пропущено: нужна модель в DC_TOK_MODEL"
+fi
+
 echo
 echo "2. эвристическое планирование (--no-llm)"
 OUT=$($DC -c "$T/distcomp.conf" --no-llm run "$GOAL" 2>&1); RC=$?
