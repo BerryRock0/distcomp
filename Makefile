@@ -92,25 +92,144 @@ $(BIN)/expr_test: $(BUILD)/expr.o $(BUILD)/util.o tests/expr_test.c | $(BIN)
 
 lite: $(LITE)
 
-# Лёгкая сборка: только UDP. TCP и DTN — это потоковые транспорты, а на
-# микроконтроллере их нет и не нужно: туда ложится ровно то, ради чего lite
-# и делается, — маленький бинарник с одним циклом и одним сокетом.
-$(LITE): $(BUILD)/daemon_lite.o $(BUILD)/util_lite.o $(BUILD)/json_lite.o \
-         $(BUILD)/conf_lite.o $(BUILD)/expr_lite.o $(BUILD)/udp_lite.o \
-         $(BUILD)/gguf_lite.o $(BUILD)/engine_lite.o $(BUILD)/tok_lite.o \
-         $(BUILD)/thread_lite.o | $(BIN)
+# Лёгкий узел. Только UDP: TCP и DTN — потоковые транспорты, а на
+# микроконтроллере их нет и не нужно. И без модели: движок занимает 23 КБ
+# текста плюс пул в ОЗУ, а запускать его там нечем. Поэтому в списке
+# объектов нет ни gguf, ни engine, ни tok — не dead code, который линкер
+# выбросит, а вовсе ненужные исходники.
+#
+# Лёгкий узел отдаёт free_mem = 0, поэтому распределитель сам не положит
+# на него слои модели, а если задача придёт — откажет внятно.
+LITE_OBJ := $(BUILD)/daemon_lite.o $(BUILD)/util_lite.o $(BUILD)/json_lite.o \
+            $(BUILD)/conf_lite.o $(BUILD)/expr_lite.o $(BUILD)/udp_lite.o \
+            $(BUILD)/thread_lite.o
+
+$(LITE): $(LITE_OBJ) | $(BIN)
 	$(CC) $(LITEFLAGS) -Wl,--gc-sections $(LDFLAGS) -o $@ $^ -lm
 
 $(BUILD)/%_lite.o: $(SRC)/%.c | $(BUILD)
 	$(CC) $(LITEFLAGS) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-parameter \
 	      -c $< -o $@
 
-# размер lite-узла: главный ориентир при выборе устройства
-size: $(LITE)
-	@echo "== обычный узел (bin/dcd) =="; size bin/dcd | tail -1
-	@echo "== lite-узел  (bin/dcd-lite) =="; size $(LITE) | tail -1
+# ================================================== виды и архитектуры ===
+#
+# Узел бывает двух видов, и разница между ними не в размере буфера, а в том,
+# что узел вообще умеет:
+#
+#   heavy  bin/dcd       сервер, Raspberry Pi, рабочая станция. Держит части
+#                        модели, считает на всех свободных ядрах, говорит по
+#                        UDP, TCP и DTN.
+#
+#   light  bin/dcd-lite  микроконтроллер: SAMD51, RP2040, ESP32, STM32.
+#                        Выражения, проверка, память. Без модели, без
+#                        потоков, только UDP. 50 КБ против 750 КБ.
+#
+# Под каждую архитектуру, для которой есть компилятор, — своя пара.
+# Кладём в bin/<arch>/: при прошивке копируется та папка, которая устройству
+# подходит, и бинарник чужой архитектуры на доску по ошибке не уедет.
+#
+#   make aarch64          собрать aarch64 (оба вида)
+#   make aarch64-light    собрать один конкретный вариант
+#   make cross            все архитектуры, для которых есть компилятор
+#   make arches           показать, что есть и чего не хватает
+
+ARCHS := x86_64 aarch64 arm riscv64 riscv32 avr
+
+# Префикс кросс-компилятора. Пустой — сборка на своей машине: тогда DC_ARCH
+# определится сам, по макросам компилятора.
+TOOLCHAIN_x86_64  :=
+TOOLCHAIN_aarch64 := aarch64-linux-gnu-
+TOOLCHAIN_arm     := arm-linux-gnueabihf-
+TOOLCHAIN_riscv64 := riscv64-unknown-elf-
+TOOLCHAIN_riscv32 := riscv32-unknown-elf-
+TOOLCHAIN_avr     := avr-
+
+# Своя машина: её имя идёт первым, и именно её сборка называется bin/dcd.
+HOST_ARCH := $(patsubst %-,%,$(notdir $(shell $(CC) -dumpmachine 2>/dev/null)))
+
+# Есть ли компилятор для этой архитектуры. Проверка на уровне make, а не в
+# shell: в цикле оболочки подставить аргумент в $(call) нельзя, а через make
+# — можно, и весь список решается один раз, а не на каждой строке.
+have-arch = $(shell command -v $(TOOLCHAIN_$(1))gcc >/dev/null 2>&1 && echo yes)
+ARCHS_OK  := $(foreach a,$(ARCHS),$(if $(call have-arch,$(a)),$(a)))
+
+# Какой цели звать, чтобы получить узел этого вида. Путь указываем целиком:
+# в подсборке bin уже переопределён, и короткое имя там не найдётся.
+FLAVOUR_TARGET_heavy = $(BIN)/$(1)/dcd
+FLAVOUR_TARGET_light = $(BIN)/$(1)/dcd-lite
+
+# Один вариант: рекурсивный make подменяет только BUILD, BIN и CC. Сами
+# правила сборки остаются одни и те же, поэтому «как собирается узел» не
+# может разойтись с обычной сборкой — и правила не приходится дублировать.
+define cross_build
+	@$(MAKE) --no-print-directory BUILD='$(BUILD)/$(1)' BIN='$(BIN)/$(1)' \
+	    CC='$(TOOLCHAIN_$(1))gcc' $(call FLAVOUR_TARGET_$(2),$(1))
+endef
+
+define arch_flavour
+$(1)-$(2): | $(BIN)/$(1)
+	$$(call cross_build,$(1),$(2))
+.PHONY: $(1)-$(2)
+endef
+
+$(foreach a,$(ARCHS),$(eval $(call arch_flavour,$(a),heavy)))
+$(foreach a,$(ARCHS),$(eval $(call arch_flavour,$(a),light)))
+
+# по одному правилу mkdir на архитектуру: объявлять его внутри define нельзя,
+# цикл зовёт его дважды — по разу на вид, и make ругается на перекрытие рецепта
+$(foreach a,$(ARCHS),$(eval $(BIN)/$(a): ; @mkdir -p $$@))
+
+# make aarch64 — оба вида сразу. Без компилятора — внятная ошибка со списком
+# того, что можно поставить, а не «command not found» из make.
+.PHONY: $(ARCHS)
+$(ARCHS):
+	@if [ -z '$(call have-arch,$@)' ]; then \
+	  echo "для $@ нужен $(TOOLCHAIN_$@)gcc — такого компилятора нет."; \
+	  echo "поставить можно так (debian/ubuntu):"; \
+	  echo "  aarch64: gcc-aarch64-linux-gnu"; \
+	  echo "  arm:     gcc-arm-linux-gnueabihf"; \
+	  echo "  riscv:   gcc-riscv64-unknown-elf"; \
+	  echo "  avr:     gcc-avr"; \
+	  echo "готовы: $(ARCHS_OK)"; \
+	  exit 1; \
+	fi
+	@$(MAKE) --no-print-directory $@-heavy $@-light
+
+.PHONY: cross arches
+cross:
+	@$(foreach a,$(ARCHS), \
+	   if [ -n '$(call have-arch,$(a))' ]; then \
+	     echo '== $(a) ($(TOOLCHAIN_$(a))gcc)'; \
+	     $(MAKE) --no-print-directory $(a) || exit 1; \
+	   else \
+	     echo '== $(a): компилятора нет — пропускаю ($(TOOLCHAIN_$(a))gcc)'; \
+	   fi; )
 	@echo
-	@$(MAKE) --no-print-directory lite-size-bytes
+	@echo 'собрано архитектур: $(words $(ARCHS_OK)) из $(words $(ARCHS))'
+
+arches:
+	@printf '%-11s %-24s %-8s %s\n' 'архитектура' 'компилятор' 'статус' 'файлы'
+	@$(foreach a,$(ARCHS), \
+	   printf '%-11s %-24s %-8s %s\n' '$(a)' '$(TOOLCHAIN_$(a))gcc' \
+	     '$(if $(call have-arch,$(a)),есть,— нет)' \
+	     '$(if $(wildcard $(BIN)/$(a)/dcd),dcd dcd-lite,—)'; )
+
+# Размеры узлов. Главный ориентир при выборе устройства: тяжёлый узел на
+# сервер, лёгкий — на плату с десятками килобайт ОЗУ.
+size: $(TARGETS) $(LITE)
+	@printf '\n== %s ==\n' 'тяжёлый узел (модель, потоки, TCP/DTN)'
+	@size $(BIN)/dcd | tail -1
+	@printf '   файла: %s байт\n\n' "$$(stat -c%s $(BIN)/dcd)"
+	@printf '== %s ==\n' 'лёгкий узел (выражения, только UDP)'
+	@size $(LITE) | tail -1
+	@printf '   файла: %s байт\n\n' "$$(stat -c%s $(LITE))"
+	@$(foreach a,$(ARCHS_OK), \
+	   if [ -f '$(BIN)/$(a)/dcd' ]; then \
+	     printf '== %s ==\n' '$(a)'; \
+	     printf '   dcd      %s байт\n' "$$(stat -c%s '$(BIN)/$(a)/dcd')"; \
+	     printf '   dcd-lite %s байт\n' "$$(stat -c%s '$(BIN)/$(a)/dcd-lite')"; \
+	   fi; )
+	@$(MAKE) --no-print-directory arches
 
 lite-size-bytes: $(LITE)
 	@echo "текст lite-узла: $$(stat -c%s $(LITE)) байт (включая libc)"
@@ -156,6 +275,7 @@ test: all
 clean:
 	rm -rf $(BUILD)
 	rm -f $(BIN)/dcctl $(BIN)/dcd $(BIN)/dcd-lite
+	rm -rf $(foreach a,$(ARCHS),$(BIN)/$(a))
 	rm -f $(BIN)/expr_test $(BIN)/quant_test $(BIN)/quant_real $(BIN)/gen_test
 	rm -f $(BIN)/dump_test $(BIN)/engine_test $(BIN)/tok_special $(BIN)/llm_tokens
 

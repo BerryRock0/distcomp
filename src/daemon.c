@@ -1,7 +1,9 @@
 #include "conf.h"
 #include "expr.h"
-#include "engine.h"
 #include "json.h"
+#ifndef DC_NO_MODEL
+#include "engine.h"
+#endif
 #include "udp.h"
 #include "tcp.h"
 #include "dtn.h"
@@ -77,15 +79,35 @@
 #endif
 
 /*
- * Лёгкая сборка для микроконтроллеров: там нет ни TCP-стека в привычном виде,
- * ни смысла в нём. Поэтому потоковые транспорты в неё не попадают вовсе, и
- * размер, ради которого всё затевалось, остаётся прежним: один цикл, один
- * сокет, один буфер в BSS.
+ * Две сборки узла, и разница между ними не в размере буфера, а в том, что
+ * узел вообще умеет:
+ *
+ *   heavy — сервер, Raspberry Pi, рабочая станция. Держит части модели,
+ *           считает на всех свободных ядрах, говорит по UDP, TCP и DTN.
+ *
+ *   light — микроконтроллер: SAMD51, RP2040, ESP32, STM32. Считает
+ *          выражения, проверяет, запоминает. Модель не держит вовсе: движок
+ *          весит 23 КБ текста и ещё 8 КБ пула в ОЗУ, а на плате с 40 КБ это
+ *          половина всей памяти ради кода, который там запускать нечем.
+ *          Потоков нет — ядро одно, и pthreads на плате есть далеко не всегда.
+ *
+ * Лёгкий узел честно сообщает free_mem = 0, поэтому распределитель и не
+ * пытается положить на него слои модели: роль назначает он сам, узел лишь
+ * показывает, на что способен.
  */
 #ifdef DC_LITE
 #define DC_HAS_STREAMS 0
+#define DC_FLAVOUR     "light"
+#define DC_NO_MODEL    1
 #else
 #define DC_HAS_STREAMS 1
+#define DC_FLAVOUR     "heavy"
+#endif
+
+#ifndef DC_NO_MODEL
+#ifndef DC_FLAVOUR
+#define DC_FLAVOUR     "heavy"
+#endif
 #endif
 
 /* Сколько байт весов узел готов держать в ОЗУ под части модели. Веса
@@ -646,6 +668,21 @@ static void role_memorize(const req_t *r, char *out, size_t outsz, char *detail,
 
 /* ----------------------------------------------------------------- llm --- */
 /*
+ * Размеры пула, арены и результата нужны обеим сборкам: разбор аргументов
+ * их печатает и проверяет, даже когда модели в узле нет. Поэтому живут
+ * здесь, а не внутри блока модели.
+ */
+#define DC_SHARD_TENSORS 48     /* по умолчанию; сверху задаётся --shard-tensors */
+#define DC_SHARD_NAME    48
+
+#ifndef DC_SHARD_RESB
+#define DC_SHARD_RESB 16384          /* максимум float в результате шага */
+#endif
+#ifndef DC_SHARD_ARENA
+#define DC_SHARD_ARENA  (256 * 1024)  /* float под активации и KV-кэш */
+#endif
+#ifndef DC_NO_MODEL
+/*
  * Часть LLM на этом устройстве.
  *
  * Узел не знает про GGUF и не парсит его: планировщик присылает тензоры
@@ -667,15 +704,6 @@ static void role_memorize(const req_t *r, char *out, size_t outsz, char *detail,
  *   part|i|n                              i-й кусок результата по n байт
  */
 
-#define DC_SHARD_TENSORS 48     /* по умолчанию; сверху задаётся --shard-tensors */
-#define DC_SHARD_NAME    48
-
-#ifndef DC_SHARD_RESB
-#define DC_SHARD_RESB 16384          /* максимум float в результате шага */
-#endif
-#ifndef DC_SHARD_ARENA
-#define DC_SHARD_ARENA  (256 * 1024)  /* float под активации и KV-кэш */
-#endif
 
 typedef struct {
     char            name[DC_SHARD_NAME];
@@ -1176,6 +1204,30 @@ static void role_shard(const req_t *r, char *out, size_t outsz, char *detail, si
  * собирается оно в одном месте: правило ответа одно на все транспорты.
  */
 
+#else /* DC_NO_MODEL — лёгкий узел */
+
+/* Заглушка вместо блока модели. Ей нужно ровно одно: честно сказать, что
+ * узел модель не держит, и не дать распределителю ошибиться. free_mem у
+ * такого узла всегда 0, поэтому раскладка модели его и не выберет, а если
+ * задача всё же придёт — отказ будет внятным, а не «неизвестная роль». */
+static void shard_describe(char *out, size_t n)
+{
+    scpy(out, n, "модель не помещается: лёгкий узел");
+}
+
+static void role_shard(const req_t *r, char *out, size_t outsz, char *detail, size_t detailsz,
+                       int *ok)
+{
+    (void)r;
+    scpy(out, outsz, "ОШИБКА");
+    scpy(detail, detailsz,
+         "это лёгкий узел: он считает выражения, но не держит модель. "
+         "Поставьте рядом тяжёлый узел — распределитель сам распределит роли.");
+    *ok = 0;
+}
+
+#endif /* DC_NO_MODEL */
+
 /* Ошибка до разбора запроса или сверх лимита — тот же формат, что у ролей:
  * планировщик читает ok/error/max_body/node в любом ответе. */
 static void json_err(buf_t *b, const char *msg)
@@ -1199,6 +1251,10 @@ static void json_pong(buf_t *b)
     badd_json(b, N.tag);
     badd(b, ",\"arch\":");
     badd_json(b, DC_ARCH);
+    /* тяжёлый или лёгкий: по этому распределитель и человек сразу видят,
+     * можно ли сюда класть слои модели, ещё до того как разберут free_mem */
+    badd(b, ",\"flavour\":");
+    badd_json(b, DC_FLAVOUR);
     badd(b, ",\"max_body\":");
     badd_u(b, (unsigned long)N.max_body);
     /* сколько ядер узел считает: по этому видно, что он не простаивает */
@@ -1572,12 +1628,21 @@ static const char *prog_name(char **argv)
 
 static void usage(const char *prog)
 {
-    dprint("%s — узел распределённых вычислений (UDP/TCP/DTN)\n", prog);
+    dprint("%s — узел распределённых вычислений, сборка «%s»\n", prog, DC_FLAVOUR);
     dprint("\n");
     dprint("  %s --port N [--tag ИМЯ] [--state DIR]\n", prog);
     dprint("      [--max-body Б] [--free-mem Б] [--pool-bytes Б] [--hello-interval N]\n");
 #if DC_HAS_STREAMS
     dprint("      [--tcp] [--dtn] [--dtn-queue DIR]\n");
+#endif
+    dprint("\n");
+#ifdef DC_NO_MODEL
+    dprint("Лёгкий узел: считает выражения, проверяет, запоминает.\n");
+    dprint("Модель он не держит — движок занимает 23 КБ текста и пул в ОЗУ,\n");
+    dprint("а на плате под это не отдать. Поэтому free_mem = 0, и распределитель\n");
+    dprint("не положит сюда слои модели. Нужны веса — поставьте тяжёлый узел.\n");
+#else
+    dprint("Тяжёлый узел: держит части модели и считает на всех свободных ядрах.\n");
 #endif
     dprint("\n");
     dprint("Роль узлу назначает распределитель — отдельно на каждую задачу,\n");
@@ -1615,7 +1680,11 @@ static void usage(const char *prog)
 
 /* Сколько памяти отдать под веса. На большой машине честнее сказать
  * «свободная память», но не больше размера пула; на микроконтроллере
- * /proc нет, и там берётся весь пул. */
+ * /proc нет, и там берётся весь пул.
+ *
+ * Лёгкому узлу не нужно: модель он не держит, отдавать нечего, и читать
+ * /proc/meminfo на плате с 40 КБ попросту незачем. */
+#ifndef DC_NO_MODEL
 static long default_free_mem(void)
 {
 #if defined(__linux__) && !defined(DC_LITE)
@@ -1636,6 +1705,7 @@ static long default_free_mem(void)
 #endif
     return (long)(shard_cap ? shard_cap : (size_t)DC_SHARD_MAX_BYTES);
 }
+#endif /* !DC_NO_MODEL */
 
 int main(int argc, char **argv)
 {
@@ -1675,8 +1745,19 @@ int main(int argc, char **argv)
         } else if (strcmp(a, "--max-body") == 0 && i + 1 < argc) {
             int mb = atoi(argv[++i]);
             if (mb > 0 && mb < DC_MAX_BODY) N.max_body = mb;
+#ifdef DC_NO_MODEL
+        } else if (strcmp(a, "--pool-bytes") == 0 && i + 1 < argc) {
+            /* Лёгкий узел не держит модель: просить пул под веса незачем.
+             * Молча проглотили бы флаг, и человек решил бы, что модель
+             * поместится. */
+            i++;
+            dprint("--pool-bytes у лёгкого узла нет: модель он не держит\n");
+#endif
         } else if (strcmp(a, "--free-mem") == 0 && i + 1 < argc) {
-            N.free_mem = atol(argv[++i]);
+            i++;
+#ifdef DC_NO_MODEL
+            dprint("--free-mem у лёгкого узла не задаётся: модель он не держит\n");
+#endif
         } else if (strcmp(a, "--pool-bytes") == 0 && i + 1 < argc) {
             pool_bytes = atol(argv[++i]);
             if (pool_bytes <= 0) {
@@ -1781,8 +1862,13 @@ int main(int argc, char **argv)
 
     /* Больше пула отдать нельзя: планировщик раскладывает веса по объёму,
      * который узел сам объявил, и лишнее он примет и отбросит. */
+#ifdef DC_NO_MODEL
+    /* Лёгкий узел не держит модель: сколько бы ни просили, отдать нечего. */
+    N.free_mem = 0;
+#else
     if (N.free_mem <= 0) N.free_mem = default_free_mem();
     if (N.free_mem > (long)shard_cap) N.free_mem = (long)shard_cap;
+#endif /* !DC_NO_MODEL */
     scpy(mpath, sizeof mpath, N.state_dir);
     scat(mpath, sizeof mpath, "/memory.log");
     mem_count_init();

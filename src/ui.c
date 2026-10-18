@@ -314,6 +314,7 @@ const char *web_ui_html(void)
 "      if (n && n.max_body) bits.push('тело ' + n.max_body + ' Б');\n"
 "      if (n && n.free_mem) bits.push('модель ' + n.free_mem + ' Б');\n"
 "      if (n && n.shard && n.shard.indexOf('слои') === 0) bits.push(n.shard);\n"
+"      if (n && n.flavour === 'light') bits.push('лёгкий');\n"
 "      if (n && n.arch) bits.push(n.arch);\n"
 "      html += \"<div class='node'><span class='dot \" + cls + \"'></span>\" +\n"
 "              \"<span class='addr'>\" + esc(n ? (n.host || u.url) : u.url) + \"</span>\" +\n"

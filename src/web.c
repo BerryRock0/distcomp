@@ -466,6 +466,11 @@ static void api_state(dc_web *w, int fd)
         sb_add_json_string(&b, ns[i].shard);
         sb_add(&b, ",\"arch\":");
         sb_add_json_string(&b, ns[i].arch);
+        /* вид узла: тяжёлый держит модель, лёгкий считает только выражения.
+         * Панель показывает это меткой, иначе «свободно 0 байт» выглядит
+         * как поломка, а это просто устройство, которому модель не нужна. */
+        sb_add(&b, ",\"flavour\":");
+        sb_add_json_string(&b, ns[i].flavour[0] ? ns[i].flavour : "heavy");
         sb_add(&b, ",\"detail\":");
         sb_add_json_string(&b, ns[i].detail);
         sb_add(&b, "}");
