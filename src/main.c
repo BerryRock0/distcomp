@@ -47,6 +47,47 @@ typedef struct {
     int  loopback;
 } disco_seen;
 
+/* --------------------------------------------------- пул рабочих ---- */
+/*
+ * Рабочий роль не объявляет: объявление несёт только его мощь. Кем он будет
+ * и сколько сделает, решает распределитель на каждой задаче — а значит, роль
+ * не обязана быть прописана в конфигурации заранее, рабочих можно найти самим.
+ *
+ * Дозаполняем пул только там, где узлов действительно не хватает: лишние две
+ * секунды ожидания перед каждой командой никому не нужны. Один раз на процесс.
+ */
+static int pool_tried = 0;
+
+static void fill_pool(dc_config *cfg, const char *need_role)
+{
+    if (pool_tried) return;
+    dc_role *r = conf_role(cfg, need_role, 0);
+    if (r && r->nep > 0) return;   /* роль описана в конфигурации — не мешаем */
+    pool_tried = 1;
+
+    char perr[256] = {0};
+    int  n = sched_pool_fill(cfg, 2, perr, sizeof perr);
+    if (n < 0) {
+        log_info("рабочие не искались: %s", perr);
+        return;
+    }
+    if (n > 0) log_info("найдено рабочих: %d", n);
+    else       log_info("рабочих в сети не найдено — беру узлы из конфигурации");
+}
+
+/* Прописана ли роль, отличная от пула: если да, конфигурация осмысленная
+ * и искать рабочих незачем. */
+static int roles_configured(const dc_config *cfg)
+{
+    for (int i = 0; i < cfg->nroles; i++)
+        if (cfg->roles[i].name && strcmp(cfg->roles[i].name, ROLE_POOL) != 0 &&
+            cfg->roles[i].nep > 0)
+            return 1;
+    return 0;
+}
+
+/* ------------------------------------------------------- discover ---- */
+
 static int discover_listen(int seconds)
 {
     if (seconds < 1) seconds = 1;
@@ -177,7 +218,10 @@ static int discover_listen(int seconds)
 
     printf("\nнайдено объявлений: %d\n", found);
     if (found) {
-        printf("добавьте нужные строки в конфигурацию, например:\n  [role compute]\n"
+        printf("\nэти рабочие и составят пул: роль им назначу сам, по одной на задачу,\n"
+               "а сколько работы достанется — по их памяти.\n"
+               "Ничего в конфигурацию вписывать не нужно.\n");
+        printf("Задать роль узлу намертво можно секцией [role compute]\n"
                "  daemon = 192.168.1.50:9101\n");
     }
     return found;
@@ -208,7 +252,8 @@ static void usage(FILE *out)
 "\n"
 "Опции:\n"
 "  -c, --config ФАЙЛ     конфигурация (по умолчанию ./distcomp.conf, ~/.distcomp.conf)\n"
-"      --role РОЛЬ=URL    назначить узла для роли (можно повторять) — выбор пользователя\n"
+"      --role РОЛЬ=URL    закрепить узел за ролью (можно повторять); без этого\n"
+            "                        распределитель сам выбирает из пула рабочих\n"
 "  -f, --plan-file ФАЙЛ  исполнить готовый план\n"
 "  -j, --concurrency N   одновременно выполняемых шагов\n"
 "      --retries N       повторов при ошибке узла\n"
@@ -240,11 +285,20 @@ static int ensure_dir(const char *path)
     return stat(tmp, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/* Каталог запусков. Никогда не берём его как есть: пустое или отсутствующее
+ * значение превратилось бы в «(null)/метка» — каталог с именем «(null)» в
+ * рабочем каталоге. Проще подставить значение по умолчанию. */
+static const char *outdir_or_default(const char *outdir)
+{
+    return (outdir && *outdir) ? outdir : "runs";
+}
+
 /* Метка запуска — это имя каталога в outdir. Два запуска в одну секунду (или
  * два процесса рядом) не должны затирать друг друга, поэтому занятая метка
  * получает счётчик. */
 static void run_id_now(char *buf, size_t n, const char *outdir)
 {
+    outdir = outdir_or_default(outdir);
     time_t    t = time(NULL);
     struct tm tmv;
     localtime_r(&t, &tmv);
@@ -274,7 +328,7 @@ static int  do_run(dc_config *cfg, const char *goal, const char *plan_file, int 
  * упорядочена по строке, поэтому сортировка обычная строковая. */
 static int read_runs(const char *outdir, char (*ids)[64], int max)
 {
-    DIR *d = opendir(outdir);
+    DIR *d = opendir(outdir_or_default(outdir));
     if (!d) return -1;
     int n = 0;
     struct dirent *e;
@@ -282,7 +336,7 @@ static int read_runs(const char *outdir, char (*ids)[64], int max)
         if (e->d_name[0] == '.') continue;
         struct stat st;
         char        p[1200];
-        snprintf(p, sizeof p, "%s/%s", outdir, e->d_name);
+        snprintf(p, sizeof p, "%s/%s", outdir_or_default(outdir), e->d_name);
         if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
         /* длинные имена каталогов обрезаем, но метка должна влезть в буфер */
         snprintf(ids[n], 64, "%.63s", e->d_name);
@@ -378,7 +432,8 @@ static int cmd_replay(dc_config *cfg, const char *what, int no_llm, int strict, 
     if (strchr(what, '/') || strstr(what, ".json"))
         snprintf(path, sizeof path, "%s", what);
     else
-        snprintf(path, sizeof path, "%s/%s/plan.json", cfg->outdir, what);
+        snprintf(path, sizeof path, "%s/%s/plan.json",
+                 outdir_or_default(cfg->outdir), what);
 
     /* отличаем «нет такого запуска» от «есть, но сломано» */
     FILE *f = fopen(path, "r");
@@ -441,10 +496,11 @@ static int do_run(dc_config *cfg, const char *goal, const char *plan_file, int e
     sched_print_plan(p, cfg);
 
     char rid[32];
-    run_id_now(rid, sizeof rid, cfg->outdir);
+    const char *outdir = outdir_or_default(cfg->outdir);
+    run_id_now(rid, sizeof rid, outdir);
 
     char rundir[1024];
-    snprintf(rundir, sizeof rundir, "%s/%s", cfg->outdir, rid);
+    snprintf(rundir, sizeof rundir, "%s/%s", outdir, rid);
     ensure_dir(rundir);
 
     char *pretty = plan_to_json(p);
@@ -665,6 +721,7 @@ int main(int argc, char **argv)
             else if (strcmp(a, "--host") == 0 && i + 1 < argc)
                 web_host = argv[++i];
         }
+        fill_pool(cfg, ROLE_SHARD);
         char     werr[512] = {0};
         dc_web  *w = web_start(cfg, web_host, web_port, "/api", no_llm, werr, sizeof werr);
         if (!w) {
@@ -693,6 +750,7 @@ int main(int argc, char **argv)
      * планировщик думает перед постройкой плана). С подкомандой
      * info/deploy/prompt/check — работа с моделью, разложенной по узлам. */
     if (strcmp(cmd, "llm") == 0) {
+        fill_pool(cfg, ROLE_SHARD);
         int rc;
         if (argc - optind > 0) {
             rc = shard_cmd(cfg, argc - optind, argv + optind, err, sizeof err);
@@ -731,6 +789,7 @@ int main(int argc, char **argv)
             free(goal_buf);
             return 2;
         }
+        if (!conf_has_daemons(cfg)) fill_pool(cfg, ROLE_COMPUTE);
         if (!conf_has_daemons(cfg)) {
             log_error("ни одной роли не обеспечено узлом — выполнять нечего.");
             conf_free(cfg);
@@ -810,6 +869,7 @@ int main(int argc, char **argv)
 
     /* ---------------------------------------------------- check ----- */
     if (strcmp(cmd, "check") == 0) {
+        if (!roles_configured(cfg)) fill_pool(cfg, ROLE_POOL);
         int rc = sched_check(cfg);
         conf_free(cfg);
         free(goal_buf);
@@ -824,9 +884,11 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    if (!conf_has_daemons(cfg)) fill_pool(cfg, ROLE_COMPUTE);
     if (!conf_has_daemons(cfg)) {
         log_error("ни одной роли не обеспечено узелом — распределять нечего.");
         log_error("Добавьте, например:  [role %s]\n  daemon = 10.0.0.5:9101", ROLE_COMPUTE);
+        log_error("или оставьте рабочих в этой сети — найду их сам (dcctl discover).");
         conf_free(cfg);
         free(goal_buf);
         return 3;

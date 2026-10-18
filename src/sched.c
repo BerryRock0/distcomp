@@ -5,10 +5,14 @@
 #include "xport.h"
 #include "util.h"
 
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define MAX_SLOTS 64
@@ -83,17 +87,180 @@ static void probe_all(dc_config *cfg)
     for (int k = 0; k < n; k++) pthread_join(th[k], NULL);
 }
 
+/* ------------------------------------------------------- пул рабочих --- */
+/*
+ * Рабочий роль больше не объявляет: в объявлении приходит только мощь —
+ * сколько байт под веса узел отдаёт, какой лимит тела и на какой платформе.
+ * Кем рабочий будет и сколько он сделает, решает распределитель, причём
+ * отдельно на каждую задачу: роль уже стоит в теле задания, и рабочий её
+ * исполняет.
+ *
+ * Поэтому найденных рабочих складываем в один пул ([role *]) и берём
+ * исполнителя оттуда, когда конкретная роль в конфигурации не описана.
+ * Перечисленные в конфигурации узлы по-прежнему приоритетнее — так можно
+ * молча оставить конкретную машину на конкретной работе.
+ */
+
+static pthread_mutex_t pool_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Уже в пуле? Ключ — имя и рабочий порт узла, а не адрес пакета: один и тот
+ * же узел слышим и по 127.0.0.1, и по адресу интерфейса. Без такой сверки
+ * в пуле окажется копия каждого устройства, и раскладка модели попытается
+ * положить два слоя на одну машину. */
+static int pool_seen(const dc_config *cfg, const char *url, const char *node, int port)
+{
+    dc_role *r = conf_role((dc_config *)cfg, ROLE_POOL, 0);
+    if (!r || !node || !*node) return 0;
+    for (int i = 0; i < r->nep; i++) {
+        if (strcmp(r->eps[i].url, url) == 0) return 1;
+        if (strcmp(r->eps[i].cap.node, node) != 0) continue;
+        char host[256] = {0};
+        int  p = 0;
+        char eperr[128] = {0};
+        if (udp_parse_endpoint(r->eps[i].url, host, sizeof host, &p, eperr, sizeof eperr) == 0 &&
+            p == port)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Находит рабочих в сети и складывает их в пул. Рабочий отвечает на запрос
+ * объявлением немедленно, поэтому ждать объявлений по таймеру не нужно, но
+ * сам запрос повторяем каждые полсекунды: объявление могло пройти мимо.
+ * Возвращает число новых рабочих, либо -1, если порт discoveries занят.
+ */
+int sched_pool_fill(dc_config *cfg, int seconds, char *err, size_t errlen)
+{
+    if (seconds <= 0) seconds = 2;
+    if (seconds > 30) seconds = 30;
+
+    char derr[256] = {0};
+    int  fd = udp_socket_bound("0.0.0.0", DC_DISCOVERY_PORT, derr, sizeof derr);
+    if (fd < 0) {
+        if (err && errlen) snprintf(err, errlen, "%s", derr);
+        return -1;
+    }
+
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+
+    int ask = udp_socket_client(NULL, 0);
+    /* без SO_BROADCAST широковещание уходит в EACCES — и молча */
+    if (ask >= 0) setsockopt(ask, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+
+    char ask_json[] = "{\"role\":\"discover\"}";
+    struct sockaddr_in baddr;
+    memset(&baddr, 0, sizeof baddr);
+    baddr.sin_family = AF_INET;
+    baddr.sin_port   = htons(DC_DISCOVERY_PORT);
+
+    long deadline = now_ms() + (long)seconds * 1000;
+    long next_ask = 0;
+    long first_at = 0;
+    int  found = 0;
+
+    while (now_ms() < deadline) {
+        /* Узел отвечает на запрос сразу, поэтому ждать всё окно незачем:
+         * как только первый ответ пришёл, даём подтянуться остальным и
+         * выходим. Иначе панель, ради которой и ищем рабочих, встала бы
+         * на лишние секунды. */
+        if (found > 0 && now_ms() - first_at > 400) break;
+
+        if (ask >= 0 && now_ms() >= next_ask) {
+            unsigned char *d = NULL;
+            size_t         dl = 0;
+            if (udp_pack(DC_MSG_PING, ask_json, &d, &dl) == 0) {
+                static const unsigned long bcast[2] = { 0xFFFFFFFFu, 0x7FFFFFFFu };
+                for (int i = 0; i < 2; i++) {
+                    baddr.sin_addr.s_addr = htonl(bcast[i]);
+                    if (sendto(ask, d, dl, 0, (struct sockaddr *)&baddr, sizeof baddr) < 0)
+                        log_debug("широковещательный запрос не ушёл: %s", strerror(errno));
+                }
+            }
+            free(d);
+            next_ask = now_ms() + 500;
+        }
+
+        unsigned char      buf[2048];
+        struct sockaddr_in from;
+        socklen_t          flen = sizeof from;
+        struct timeval     tv = { 0, 200000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+        ssize_t r = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
+        if (r <= 0) continue;
+
+        dc_msg m;
+        char   perr[192] = {0};
+        if (udp_unpack(buf, (size_t)r, &m, perr, sizeof perr) != 0) continue;
+        if (m.type != DC_MSG_HELLO) continue;
+
+        char json[2049];
+        size_t len = m.body_len < sizeof json - 1 ? m.body_len : sizeof json - 1;
+        memcpy(json, m.body, len);
+        json[len] = '\0';
+
+        js_doc *doc = js_parse(json, perr, sizeof perr);
+        if (!doc) continue;
+        const js_value *root = js_root(doc);
+        const char *node = js_get_str(root, "node");
+        char        nm[32];
+        snprintf(nm, sizeof nm, "%s", node ? node : "");
+        /* порт берём из объявления: источник HELLO — эфемерный сокет */
+        int         port = (int)js_num(js_get(root, "port"), 0);
+        js_doc_free(doc);
+        if (port <= 0) continue;
+
+        char url[160];
+        snprintf(url, sizeof url, "udp://%s:%d", inet_ntoa(from.sin_addr), port);
+
+        pthread_mutex_lock(&pool_mu);
+        int dup = pool_seen(cfg, url, nm, port);
+        int rc = 0;
+        if (!dup) {
+            dc_role *pool = conf_role(cfg, ROLE_POOL, 1);
+            if (!pool) rc = -1;
+            else {
+                int before = pool->nep;
+                rc = conf_role_add_ep(pool, url);
+                /* имя узла запомним сразу: по нему же узнаём дубликат, когда
+                 * тот же узел объявится со второго адреса. Точные возможности
+                 * проставит общий опрос по PING. */
+                if (rc == 0 && pool->nep > before)
+                    snprintf(pool->eps[before].cap.node, sizeof pool->eps[before].cap.node,
+                             "%s", nm);
+            }
+        }
+        pthread_mutex_unlock(&pool_mu);
+
+        if (!dup && rc == 0) {
+            if (!found) first_at = now_ms();
+            found++;
+        }
+    }
+
+    close(fd);
+    if (ask >= 0) close(ask);
+    return found;
+}
+
 /* ------------------------------------------------- выбор узла ------- */
 
-/* Узел подходит, если умеет роль и принимает тело заданного размера.
- * Для маленьких устройств max_body мал, и это главный фильтр: без него
- * планировщик слал бы ESP32 задачу на 8 КБ и молча ждал таймаут.
+/* Узел подходит, если принимает тело заданного размера. Роль рабочему больше
+ * ничего не говорит: её назначает распределитель в теле задания, поэтому
+ * исполнителя берём из общей секции роли, а если та не описана — из пула
+ * найденных рабочих. Для маленьких устройств max_body мал, и это главный
+ * фильтр: без него планировщик слал бы ESP32 задачу на 8 КБ и молча ждал
+ * таймаут.
  *
  * Если у шага закреплён узел (pin) — выбор один: слой модели лежит там
  * и только там, отдать его соседу нельзя. */
 static dc_endpoint *pick_ep(runner *r, const char *role, const char *pin, int body_len)
 {
     dc_role *rl = conf_role(r->cfg, role, 0);
+    if (!rl || rl->nep == 0) rl = conf_role(r->cfg, ROLE_POOL, 0);
     if (!rl || rl->nep == 0) return NULL;
 
     lock(r);
@@ -527,8 +694,10 @@ void sched_print_plan(const plan *p, const dc_config *cfg)
             if (s->ndeps > 3) strncat(deps, ",...", sizeof deps - strlen(deps) - 1);
         }
 
-        const dc_role *r = conf_role((dc_config *)cfg, s->role, 0);
-        char           eps[160] = "НЕ НАЗНАЧЕН";
+        const dc_role *own = conf_role((dc_config *)cfg, s->role, 0);
+        int from_pool = (!own || own->nep == 0);
+        const dc_role *r = from_pool ? conf_role((dc_config *)cfg, ROLE_POOL, 0) : own;
+        char eps[160] = "НЕ НАЗНАЧЕН";
         if (s->pin) {
             /* закреплённый шаг показываем на том узле, где он и пойдёт */
             snprintf(eps, sizeof eps, "%s (закреплён)", s->pin);
@@ -538,9 +707,12 @@ void sched_print_plan(const plan *p, const dc_config *cfg)
         if (r && r->nep) {
             snprintf(eps, sizeof eps, "%s", r->eps[0].url);
             if (r->nep > 1) {
-                char num[16];
-                snprintf(num, sizeof num, " (+%d)", r->nep - 1);
+                char num[24];
+                /* роль никто не объявлял: исполнителя берём из пула целиком */
+                snprintf(num, sizeof num, from_pool ? " (+%d из пула)" : " (+%d)", r->nep - 1);
                 strncat(eps, num, sizeof eps - strlen(eps) - 1);
+            } else if (from_pool) {
+                strncat(eps, " из пула", sizeof eps - strlen(eps) - 1);
             }
         }
         printf("  %-4s %-9s %-12s %-30s %s\n", s->id, s->role, deps, eps, s->title);
@@ -682,9 +854,16 @@ int sched_check(dc_config *cfg)
     int bad = 0, total = 0;
     for (int i = 0; i < cfg->nroles; i++) {
         dc_role *r = &cfg->roles[i];
-        printf("роль %-9s %d узел(ов)\n", r->name, r->nep);
+        /* пул — не роль: это просто найденные рабочие, роль им назначит
+         * распределитель, когда дойдёт дело */
+        int is_pool = r->name && strcmp(r->name, ROLE_POOL) == 0;
+        if (is_pool) printf("пул            %d узел(ов)\n", r->nep);
+        else          printf("роль %-9s %d узел(ов)\n", r->name, r->nep);
         if (r->nep == 0) {
-            printf("    узлы не назначены — добавьте [role %s] daemon = host:port\n", r->name);
+            if (is_pool)
+                printf("    рабочие не найдены — запустите dcd, распределитель найдёт их сам\n");
+            else
+                printf("    узлы не назначены — добавьте [role %s] daemon = host:port\n", r->name);
             bad++;
             continue;
         }
@@ -715,7 +894,10 @@ int sched_check(dc_config *cfg)
             if (cap.known) printf(", лимит тела %d байт", cap.max_body);
             if (cap.free_mem > 0) printf(", под модель %ld байт", cap.free_mem);
             if (cap.shard[0] && strncmp(cap.shard, "пусто", 5) != 0) printf(" [%s]", cap.shard);
-            if (cap.roles[0]) printf(", роли: %s", cap.roles);
+            if (cap.roles[0] && strcmp(cap.roles, "*") != 0)
+                printf(", роли: %s", cap.roles);
+            else
+                printf(", роль любая");
             if (cap.arch[0]) printf(" [%s]", cap.arch);
             putchar('\n');
         }

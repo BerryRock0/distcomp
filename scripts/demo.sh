@@ -8,11 +8,11 @@ RUN=.demo
 rm -rf "$RUN"; mkdir -p "$RUN/state"
 
 # --- планировщик: обычный узел и lite-узел (для маленьких устройств) ------
-./bin/dcd --role compute --role verify --port 9101 --tag server-a \
+./bin/dcd --port 9101 --tag server-a \
          --state "$RUN/state" >"$RUN/server-a.log" 2>&1 &
 A=$!
 # lite-сборка: лимит тела 1024 байта, пул модели 8 КБ — как у микроконтроллера
-./bin/dcd-lite --role compute --role memorize --port 9102 --tag mcu-01 \
+./bin/dcd-lite --port 9102 --tag mcu-01 \
          --free-mem 1200 --state "$RUN/state" >"$RUN/mcu-01.log" 2>&1 &
 B=$!
 
@@ -20,15 +20,15 @@ B=$!
 # Конвейеру нужны минимум три узла: вход, слои и выход живут на разных
 # устройствах (узел держит ровно один контекст движка). Возьмём пять и дадим
 # большим узлам больше памяти — им достанется больше слоёв.
-./bin/dcd --role shard --port 9111 --tag in  --free-mem 450000 --state "$RUN/state" >"$RUN/sh-in.log"  2>&1 &
+./bin/dcd --port 9111 --tag in  --free-mem 450000 --state "$RUN/state" >"$RUN/sh-in.log"  2>&1 &
 S1=$!
-./bin/dcd --role shard --port 9112 --tag big --free-mem 450000 --state "$RUN/state" >"$RUN/sh-big.log" 2>&1 &
+./bin/dcd --port 9112 --tag big --free-mem 450000 --state "$RUN/state" >"$RUN/sh-big.log" 2>&1 &
 S2=$!
-./bin/dcd --role shard --port 9113 --tag sm1 --free-mem 250000 --state "$RUN/state" >"$RUN/sh-sm1.log" 2>&1 &
+./bin/dcd --port 9113 --tag sm1 --free-mem 250000 --state "$RUN/state" >"$RUN/sh-sm1.log" 2>&1 &
 S3=$!
-./bin/dcd --role shard --port 9114 --tag sm2 --free-mem 250000 --state "$RUN/state" >"$RUN/sh-sm2.log" 2>&1 &
+./bin/dcd --port 9114 --tag sm2 --free-mem 250000 --state "$RUN/state" >"$RUN/sh-sm2.log" 2>&1 &
 S4=$!
-./bin/dcd --role shard --port 9115 --tag out --free-mem 450000 --state "$RUN/state" >"$RUN/sh-out.log" 2>&1 &
+./bin/dcd --port 9115 --tag out --free-mem 450000 --state "$RUN/state" >"$RUN/sh-out.log" 2>&1 &
 S5=$!
 trap 'kill $A $B $S1 $S2 $S3 $S4 $S5 2>/dev/null || true' EXIT
 sleep 1

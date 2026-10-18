@@ -101,8 +101,6 @@
 typedef struct {
     int  port;
     int  max_body;
-    int  serve[4];
-    int  nroles;
     char tag[32];
     char state_dir[256];
     long served;
@@ -114,12 +112,9 @@ typedef struct {
 
 static node N;   /* единственный экземпляр — в BSS, без malloc */
 
-static const char *role_name(int idx)
-{
-    static const char *names[] = { ROLE_COMPUTE, ROLE_VERIFY, ROLE_MEMORIZE, ROLE_SHARD };
-    return idx >= 0 && idx < 4 ? names[idx] : "?";
-}
-
+/* Имя роли в ответе узла больше не нужно: рабочий исполняет любую назначенную
+ * роль и не объявляет, кем он является. Разбор входящей роли остался — по ней
+ * выбирается движок. */
 static int role_index(const char *name)
 {
     if (str_ieq(name, ROLE_COMPUTE)) return 0;
@@ -494,13 +489,12 @@ static int req_parse(const char *json, req_t *r)
 }
 
 /* -------------------------------------------------------- роли ---- */
-
-static int role_allowed(int idx)
-{
-    for (int i = 0; i < N.nroles; i++)
-        if (N.serve[i] == idx) return 1;
-    return 0;
-}
+/* Роль рабочий не объявляет и не фильтрует по ней: её назначает
+ * распределитель на каждую задачу, а рабочий исполняет любую — все движки
+ * (арифметика, проверка, память, модель) лежат у него в одном бинарнике.
+ * Раньше здесь стояла проверка role_allowed(), и узел, объявивший себя
+ * compute, отказывался в разложении модели. Теперь отказа нет: что делать,
+ * решает распределитель, а не сам узел. */
 
 static void role_compute(const req_t *r, char *out, size_t outsz, char *detail,
                          size_t detailsz, int *ok)
@@ -1205,7 +1199,9 @@ static void json_pong(buf_t *b)
     badd_json(b, DC_ARCH);
     badd(b, ",\"max_body\":");
     badd_u(b, (unsigned long)N.max_body);
-    /* сколько памяти отдаём под веса модели и что уже держим */
+    /* сколько памяти отдаём под веса модели и что уже держим. Лёгкий узел
+     * не держит модель вовсе, поэтому честно отдаёт ноль: раскладка модели
+     * выбирает по free_mem, и ноль означает «сюда класть нечего». */
     badd(b, ",\"free_mem\":");
     badd_u(b, (unsigned long)N.free_mem);
     badd(b, ",\"shard\":");
@@ -1214,12 +1210,7 @@ static void json_pong(buf_t *b)
         shard_describe(sdesc, sizeof sdesc);
         badd_json(b, sdesc);
     }
-    badd(b, ",\"roles\":\"");
-    for (int i = 0; i < N.nroles; i++) {
-        if (i) badd(b, ",");
-        badd(b, role_name(N.serve[i]));
-    }
-    badd(b, "\"}");
+    badd(b, ",\"roles\":\"*\"}");
 }
 
 static void send_reply(int fd, const struct sockaddr_in *to, const char *json)
@@ -1269,8 +1260,10 @@ static void apply_scheduler_config(const char *json)
         dprint("планировщик: free_mem = %ld\n", N.free_mem);
     }
     if (hs >= 0) {
-        /* hello_interval = 0 означает отключение broadcast */
-        dprint("планировщик: hello_interval = %.0f\n", hs);
+        /* hello_interval = 0 означает отключение broadcast.
+         * Печатаем целым: dprint — самодельный форматтер, и %.0f он не
+         * разбирает, а печатал спецификацию дословно. */
+        dprint("планировщик: hello_interval = %d\n", (int)hs);
         /* Применяется при следующем HELLO — здесь только запоминаем */
     }
     if (ut >= 0) {
@@ -1308,25 +1301,16 @@ static void send_pong(int fd, const struct sockaddr_in *to)
 static void build_reply(const req_t *r, buf_t *res)
 {
     int idx = role_index(r->role);
-    int allowed = role_allowed(idx);
 
     char out[512], detail[512];
     out[0] = detail[0] = '\0';
     int ok = 1;
 
+    /* Роль не проверяем: рабочий исполняет любую, которую назначил
+     * распределитель. Неизвестная роль — единственный отказ. */
     if (idx < 0) {
         scpy(out, sizeof out, "ОШИБКА");
         scpy(detail, sizeof detail, "неизвестная роль");
-        ok = 0;
-    } else if (!allowed) {
-        scpy(out, sizeof out, "ОШИБКА");
-        scpy(detail, sizeof detail, "узел ");
-        scat(detail, sizeof detail, N.tag);
-        scat(detail, sizeof detail, " обслуживает только ");
-        for (int i = 0; i < N.nroles; i++) {
-            if (i) scat(detail, sizeof detail, ",");
-            scat(detail, sizeof detail, role_name(N.serve[i]));
-        }
         ok = 0;
     } else if (idx == 0) {
         role_compute(r, out, sizeof out, detail, sizeof detail, &ok);
@@ -1351,18 +1335,13 @@ static void build_reply(const req_t *r, buf_t *res)
     badd_u(res, (unsigned long)N.max_body);
     badd(res, ",\"free_mem\":");
     badd_u(res, (unsigned long)N.free_mem);
-    if (role_allowed(3)) {
+    {
         char sdesc[96];
         shard_describe(sdesc, sizeof sdesc);
         badd(res, ",\"shard\":");
         badd_json(res, sdesc);
     }
-    badd(res, ",\"roles\":\"");
-    for (int i = 0; i < N.nroles; i++) {
-        if (i) badd(res, ",");
-        badd(res, role_name(N.serve[i]));
-    }
-    badd(res, "\"");
+    badd(res, ",\"roles\":\"*\"");
     if (!ok) {
         badd(res, ",\"error\":");
         badd_json(res, detail[0] ? detail : "проверка не пройдена");
@@ -1520,16 +1499,14 @@ static void serve_stream(int fd, int is_dtn)
 
 static void broadcast_hello(void)
 {
-    char list[96] = "";
-    for (int i = 0; i < N.nroles; i++) {
-        if (i) scat(list, sizeof list, ",");
-        scat(list, sizeof list, role_name(N.serve[i]));
-    }
+    /* Роли в объявлении больше нет: рабочий сообщает только свою мощь
+     * (память, лимит тела, платформу). Кто он будет и сколько сделает —
+     * решает распределитель на каждую задачу. */
     char sdesc[96];
     shard_describe(sdesc, sizeof sdesc);
     unsigned char *d = NULL;
     size_t         dl = 0;
-    if (udp_pack_hello(N.max_body, list, DC_ARCH, N.tag, N.port, N.free_mem, sdesc, &d, &dl) != 0)
+    if (udp_pack_hello(N.max_body, DC_ARCH, N.tag, N.port, N.free_mem, sdesc, &d, &dl) != 0)
         return;
 
     /* из эфемерного сокета: адрес источника объявления ничего не значит,
@@ -1570,13 +1547,15 @@ static void usage(const char *prog)
 {
     dprint("%s — узел распределённых вычислений (UDP/TCP/DTN)\n", prog);
     dprint("\n");
-    dprint("  %s --role compute [--role verify] [--role memorize] [--role shard] --port N\n",
-           prog);
-    dprint("      [--tag ИМЯ] [--state DIR] [--max-body Б] [--free-mem Б] [--hello-interval N]\n");
+    dprint("  %s --port N [--tag ИМЯ] [--state DIR]\n", prog);
+    dprint("      [--max-body Б] [--free-mem Б] [--pool-bytes Б] [--hello-interval N]\n");
+#if DC_HAS_STREAMS
     dprint("      [--tcp] [--dtn] [--dtn-queue DIR]\n");
+#endif
     dprint("\n");
-    dprint("Один процесс может обслуживать несколько ролей — для устройств,\n");
-    dprint("где запуск трёх процессов не помещается в память.\n");
+    dprint("Роль узлу назначает распределитель — отдельно на каждую задачу,\n");
+    dprint("поэтому объявлять её здесь не нужно: узел исполняет ту, что пришла\n");
+    dprint("в задании. Настраивать надо только мощь, а не «кем я буду».\n");
     dprint("\n");
     dprint("  --max-body   сколько байт тела узел примет (планировщик не пришлёт\n");
     dprint("               больше; по умолчанию %d)\n", DC_MAX_BODY);
@@ -1638,16 +1617,13 @@ int main(int argc, char **argv)
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
+        /* Роль рабочий больше не объявляет: её назначает распределитель
+         * на каждую задачу. Рабочий исполняет любую — все движки у него
+         * в одном бинарнике. Поэтому ни --role, ни списка ролей здесь
+         * больше нет: настраивать нужно только мощь, а не «кем я буду». */
         if (strcmp(a, "--role") == 0 && i + 1 < argc) {
-            int idx = role_index(argv[++i]);
-            if (idx < 0) {
-                dprint("неизвестная роль: %s\n", argv[i]);
-                return 2;
-            }
-            int dup = 0;
-            for (int k = 0; k < N.nroles; k++)
-                if (N.serve[k] == idx) dup = 1;
-            if (!dup && N.nroles < 4) N.serve[N.nroles++] = idx;
+            dprint("--role больше не нужно: роль назначает распределитель\n");
+            i++;
         } else if (strcmp(a, "--port") == 0 && i + 1 < argc) {
             N.port = atoi(argv[++i]);
         } else if (strcmp(a, "--tag") == 0 && i + 1 < argc) {
@@ -1657,6 +1633,8 @@ int main(int argc, char **argv)
         } else if (strcmp(a, "--max-body") == 0 && i + 1 < argc) {
             int mb = atoi(argv[++i]);
             if (mb > 0 && mb < DC_MAX_BODY) N.max_body = mb;
+        } else if (strcmp(a, "--free-mem") == 0 && i + 1 < argc) {
+            N.free_mem = atol(argv[++i]);
         } else if (strcmp(a, "--pool-bytes") == 0 && i + 1 < argc) {
             pool_bytes = atol(argv[++i]);
             if (pool_bytes <= 0) {
@@ -1704,7 +1682,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!N.nroles || !N.port) {
+    if (!N.port) {
         usage(prog_name(argv));
         return 2;
     }
@@ -1765,7 +1743,7 @@ int main(int argc, char **argv)
     if (N.free_mem > (long)shard_cap) N.free_mem = (long)shard_cap;
     scpy(mpath, sizeof mpath, N.state_dir);
     scat(mpath, sizeof mpath, "/memory.log");
-    if (role_allowed(2)) mem_count_init();
+    mem_count_init();
     mkdir(N.state_dir, 0775);
 #if DC_HAS_STREAMS
     if (N.use_dtn) {
@@ -1794,11 +1772,10 @@ int main(int argc, char **argv)
     }
 
     const char *prog = prog_name(argv);
-    dprint("%s: порт %d, роли", prog, N.port);
-    for (int i = 0; i < N.nroles; i++) dprint(" %s", role_name(N.serve[i]));
+    dprint("%s: порт %d", prog, N.port);
     dprint(", лимит тела %d байт, платформа %s%s", N.max_body, DC_ARCH,
            no_hello ? ", без объявления" : "");
-    if (role_allowed(3)) {
+    {
         char sdesc[96];
         shard_describe(sdesc, sizeof sdesc);
         dprint(", под модель %d байт", (int)N.free_mem);
@@ -1816,12 +1793,11 @@ int main(int argc, char **argv)
     }
 #endif
 
-    dprint("%s: порт %d, роли", prog_name(argv), N.port);
-    for (int i = 0; i < N.nroles; i++) dprint(" %s", role_name(N.serve[i]));
+    dprint("%s: порт %d", prog_name(argv), N.port);
     dprint(", лимит тела %d байт, платформа %s%s", N.max_body, DC_ARCH,
            no_hello ? ", без объявления" : "");
     if (N.use_tcp) dprint(", TCP%s", N.use_dtn ? "/DTN" : "");
-    if (role_allowed(3)) {
+    {
         char sdesc[96];
         shard_describe(sdesc, sizeof sdesc);
         dprint(", под модель %d байт", (int)N.free_mem);

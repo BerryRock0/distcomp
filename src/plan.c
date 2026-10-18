@@ -196,7 +196,13 @@ plan *plan_from_json(const char *json, const dc_config *cfg, char *err, size_t e
         const char *role = js_get_str(sv, "role");
         if (!role || !*role) role = ROLE_COMPUTE;
 
-        if (!conf_role((dc_config *)cfg, role, 0)) {
+        /* Роль не обязана быть прописана в конфигурации: рабочий её не
+         * объявляет, а назначает распределитель на каждой задаче. Поэтому
+         * роль принимается, если есть узлы в самой роли или, если её нет,
+         * пул найденных рабочих. */
+        dc_role *have = conf_role((dc_config *)cfg, role, 0);
+        if (!have || have->nep == 0) have = conf_role((dc_config *)cfg, ROLE_POOL, 0);
+        if (!have || have->nep == 0) {
             strbuf known;
             sb_init(&known);
             for (int k = 0; k < cfg->nroles; k++) {
@@ -206,7 +212,9 @@ plan *plan_from_json(const char *json, const dc_config *cfg, char *err, size_t e
             snprintf(err, errlen,
                      "шаг \"%s\": роль \"%s\" не назначена ни одному узлу "
                      "(настроенные роли: %s). Задайте узла в конфигурации "
-                     "([role %s] daemon = http://host:port) или через --role %s=URL",
+                     "([role %s] daemon = http://host:port), оставьте рабочих "
+                     "в сети — тогда распределитель найдёт их сам — "
+                     "или закрепите узел через --role %s=URL",
                      id, role, known.p ? known.p : "нет",
                      role, role);
             sb_free(&known);
