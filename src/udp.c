@@ -63,18 +63,21 @@ static uint32_t get_u32(const unsigned char *p)
 
 /* Компактная сборка capability-JSON без strbuf: на маленьком устройстве
  * лишняя аллокация стоит дороже самого сообщения. Значения здесь берутся
- * только из доверенных источников (имя узла, роли), кавычки не экранируются. */
-int udp_pack_hello(int max_body, const char *roles, const char *arch, const char *node,
+ * только из доверенных источников (имя узла, платформа), кавычки не
+ * экранируются. Роли в объявлении нет: узел их не знает. */
+int udp_pack_hello(int max_body, const char *arch, const char *node,
                    int port, long free_mem, const char *shard, unsigned char **out,
                    size_t *out_len)
 {
     char json[768];
     /* port обязателен: объявление уходит с нового эфемерного сокета, и без
-     * него получатель не узнал бы, куда стучаться */
+     * него получатель не узнал бы, куда стучаться. free_mem и shard идут в
+     * объявление, чтобы планировщик видел память устройства ещё до того, как
+     * начнёт раскладывать по нему модель. */
     snprintf(json, sizeof json,
-             "{\"role\":\"%s\",\"node\":\"%s\",\"arch\":\"%s\",\"port\":%d,"
+             "{\"role\":\"*\",\"node\":\"%s\",\"arch\":\"%s\",\"port\":%d,"
              "\"max_body\":%d,\"free_mem\":%ld,\"shard\":\"%s\",\"proto\":%d}",
-             roles ? roles : "", node ? node : "", arch ? arch : "", port, max_body, free_mem,
+             node ? node : "", arch ? arch : "", port, max_body, free_mem,
              shard ? shard : "", DC_UDP_VERSION);
     return udp_pack(DC_MSG_HELLO, json, out, out_len);
 }

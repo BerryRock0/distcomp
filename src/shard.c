@@ -279,13 +279,36 @@ typedef struct {
     int          stage, first, last;   /* какая стадия лежит */
 } llm_node;
 
+/* Сколько слоёв достанется узлу: у того, у кого больше свободной памяти.
+ * Сортируем по убыванию — тогда первая тройка (вход, слои, выход) уходит
+ * самым крупным, а мелким остаётся хвост, и раскладка ниже распределяет
+ * слои по убыванию места. Это и есть «сколько»: распределитель сам решает,
+ * кому сколько весов держать, рабочий о своей доле не знает. */
+static int cmp_llm_node(const void *a, const void *b)
+{
+    const llm_node *x = a, *y = b;
+    if (x->cap > y->cap) return -1;
+    if (x->cap < y->cap) return 1;
+    /* при равной памяти порядок всё равно фиксируем — иначе раскладка
+     * подпрыгивала бы от запуска к запуску и сеть зря гоняла активацию */
+    if (x->ep && y->ep) {
+        int c = strcmp(x->ep->url, y->ep->url);
+        if (c != 0) return c;
+    }
+    return 0;
+}
+
 static int collect_nodes(dc_config *cfg, llm_node *out, int max, char *err, size_t errlen)
 {
     dc_role *r = conf_role(cfg, ROLE_SHARD, 0);
+    /* Роли рабочий не объявляет, поэтому если секции [role shard] нет —
+     * раскладываем по пулу: тем рабочим, которых нашли в сети. */
+    if (!r || r->nep == 0) r = conf_role(cfg, ROLE_POOL, 0);
     if (!r || r->nep == 0) {
         snprintf(err, errlen,
                  "нет ни одного узла роли %s: добавьте секцию [role %s] daemon = host:port "
-                 "для устройств, на которых будет лежать модель",
+                 "для устройств, на которых будет лежать модель, либо запустите рабочие "
+                 "так, чтобы планировщик нашёл их сам",
                  ROLE_SHARD, ROLE_SHARD);
         return -1;
     }
@@ -311,6 +334,7 @@ static int collect_nodes(dc_config *cfg, llm_node *out, int max, char *err, size
         out[n].first = out[n].last = -1;
         n++;
     }
+    qsort(out, (size_t)n, sizeof out[0], cmp_llm_node);
     return n;
 }
 

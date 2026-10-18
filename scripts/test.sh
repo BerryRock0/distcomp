@@ -20,6 +20,7 @@
 #  18. модель llama (GGUF) разложена по свободной памяти устройств
 #  19. разложенная по устройствам модель считает так же, как целиком
 #      (сверка с локальным прогоном и независимым эталоном на numpy)
+#  21. рабочий роль не объявляет, а распределитель находит и на��значает её сам
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -36,10 +37,10 @@ cleanup() { for p in $PIDS; do kill "$p" 2>/dev/null; done; }
 trap cleanup EXIT
 
 start_daemons() {
-  "$DCD" --role compute  --port $((BASE+1)) --tag cpu-a --state "$T/state" >"$T/cpu-a.log" 2>&1 & PIDS="$PIDS $!"
-  "$DCD" --role compute  --port $((BASE+2)) --tag cpu-b --state "$T/state" >"$T/cpu-b.log" 2>&1 & PIDS="$PIDS $!"
-  "$DCD" --role verify   --port $((BASE+3)) --tag chk   --state "$T/state" >"$T/chk.log"   2>&1 & PIDS="$PIDS $!"
-  "$DCD" --role memorize --port $((BASE+4)) --tag mem   --state "$T/state" >"$T/mem.log"   2>&1 & PIDS="$PIDS $!"
+  "$DCD" --port $((BASE+1)) --tag cpu-a --state "$T/state" >"$T/cpu-a.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --port $((BASE+2)) --tag cpu-b --state "$T/state" >"$T/cpu-b.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --port $((BASE+3)) --tag chk   --state "$T/state" >"$T/chk.log"   2>&1 & PIDS="$PIDS $!"
+  "$DCD" --port $((BASE+4)) --tag mem   --state "$T/state" >"$T/mem.log"   2>&1 & PIDS="$PIDS $!"
   sleep 0.6
 }
 
@@ -85,11 +86,11 @@ GOAL='посчитать стоимость закупки 1250*3, затем д
 # узлах, где памяти в обрез.
 PL1=$((BASE+80)); PL2=$((BASE+81)); PL3=$((BASE+82)); PL4=$((BASE+83)); PL5=$((BASE+84))
 start_planner_shards() {
-  "$DCD" --role shard --port $PL1 --tag p-in  --free-mem 2000000 --state "$T/state" >"$T/pl1.log" 2>&1 & PIDS="$PIDS $!"
-  "$DCD" --role shard --port $PL2 --tag p-big --free-mem 2000000 --state "$T/state" >"$T/pl2.log" 2>&1 & PIDS="$PIDS $!"
-  "$DCD" --role shard --port $PL3 --tag p-s1  --free-mem 2000000 --state "$T/state" >"$T/pl3.log" 2>&1 & PIDS="$PIDS $!"
-  "$DCD" --role shard --port $PL4 --tag p-s2  --free-mem 2000000 --state "$T/state" >"$T/pl4.log" 2>&1 & PIDS="$PIDS $!"
-  "$DCD" --role shard --port $PL5 --tag p-out --free-mem 2000000 --state "$T/state" >"$T/pl5.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --port $PL1 --tag p-in  --free-mem 2000000 --state "$T/state" >"$T/pl1.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --port $PL2 --tag p-big --free-mem 2000000 --state "$T/state" >"$T/pl2.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --port $PL3 --tag p-s1  --free-mem 2000000 --state "$T/state" >"$T/pl3.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --port $PL4 --tag p-s2  --free-mem 2000000 --state "$T/state" >"$T/pl4.log" 2>&1 & PIDS="$PIDS $!"
+  "$DCD" --port $PL5 --tag p-out --free-mem 2000000 --state "$T/state" >"$T/pl5.log" 2>&1 & PIDS="$PIDS $!"
   sleep 0.8
   cat > "$T/plan.conf" <<EOF
 [llm]
@@ -346,8 +347,18 @@ echo
 echo "11. веб-панель"
 env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY \
   $DC -c "$T/distcomp.conf" --no-llm --host 127.0.0.1 --port "$WEB" web >"$T/web.log" 2>&1 & PIDS="$PIDS $!"
-sleep 0.8
-HTML=$(curl -s "http://127.0.0.1:$WEB/" || true)
+# Панель сначала спрашивает сеть, где рабочие, и только потом поднимается —
+# сколько это займёт, неизвестно. Поэтому не ждём фиксированную паузу, а
+# долбимся, пока сервер не ответит.
+HTML=""
+for _ in $(seq 1 60); do
+  HTML=$(curl -s --max-time 2 "http://127.0.0.1:$WEB/" 2>/dev/null || true)
+  # Ждём не «непустой ответ», а сам признак готовности: сокет может принять
+  # соединение раньше, чем панель дослала страницу, и тогда первый непустой
+  # ответ окажется обрезанным — страница есть, а заголовка в ней нет.
+  case "$HTML" in *"<title>distcomp"*) break ;; esac
+  sleep 0.25
+done
 check "страница отдаётся"          "$HTML" "<title>distcomp"
 check "есть поле цели"             "$HTML" "id='goal'"
 check "есть форма узлов"           "$HTML" "id='furl'"
@@ -434,7 +445,7 @@ check "узел добавлен через UI"     "$STATE" '"name":"compute"'
 echo
 echo "12. lite-узел (сборка для маленьких устройств)"
 LITE=$((BASE+50))
-./bin/dcd-lite --role compute --role memorize --port $LITE --tag lite --state "$T/state" \
+./bin/dcd-lite --port $LITE --tag lite --state "$T/state" \
   >"$T/lite.log" 2>&1 & PIDS="$PIDS $!"
 sleep 0.6
 check "запускается lite-сборка"    "$(cat "$T/lite.log")" "dcd-lite"
@@ -452,7 +463,7 @@ outdir = $T/runs
 EOF
 OUT=$($DC -c "$T/lite.conf" check 2>&1)
 check " lite-узел отвечает"        "$OUT" "живой"
-check "объявляет обе роли"          "$OUT" "compute,memorize"
+check "роли не объявляет — исполнит любую" "$OUT" "роль любая"
 check "объявляет свой лимит тела"   "$OUT" "1024 байт"
 cat > "$T/lite.json" <<'EOF'
 {"goal":"задача для lite-узла","steps":[
@@ -482,7 +493,7 @@ check "код возврата 1"              "$RC"  "1"
 echo
 echo "14. смешанный парк: сервер + lite в одной роли"
 SRV=$((BASE+51))
-./bin/dcd --role compute --role verify --port $SRV --tag srv --hello-interval 2 \
+./bin/dcd --port $SRV --tag srv --hello-interval 2 \
   --state "$T/state" >"$T/srv.log" 2>&1 & PIDS="$PIDS $!"
 sleep 0.6
 cat > "$T/mix.conf" <<EOF
@@ -538,7 +549,7 @@ echo "16. обнаружение узлов по запросу (без ожид
 # узел уже объявился при старте и больше молчит 10 с — discover всё равно
 # должен найти его сразу: поиск идёт активным запросом, а не ожиданием
 DISC=$((BASE+60))
-"$DCD" --role compute --port $DISC --tag disc-01 --state "$T/state" >"$T/disc.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --port $DISC --tag disc-01 --state "$T/state" >"$T/disc.log" 2>&1 & PIDS="$PIDS $!"
 sleep 1.2
 OUT=$($DC -c "$T/distcomp.conf" discover 2 2>&1); RC=$?
 check "узел найден"                 "$OUT" "disc-01"
@@ -590,11 +601,11 @@ fi
 echo
 echo "18. модель разложена по памяти устройств (GGUF/llama)"
 SH1=$((BASE+70)); SH2=$((BASE+71)); SH3=$((BASE+72)); SH4=$((BASE+73)); SH5=$((BASE+74))
-"$DCD" --role shard --port $SH1 --tag in  --free-mem 450000 --state "$T/state" >"$T/sh1.log" 2>&1 & PIDS="$PIDS $!"
-"$DCD" --role shard --port $SH2 --tag big --free-mem 450000 --state "$T/state" >"$T/sh2.log" 2>&1 & PIDS="$PIDS $!"
-"$DCD" --role shard --port $SH3 --tag sm1 --free-mem 250000 --state "$T/state" >"$T/sh3.log" 2>&1 & PIDS="$PIDS $!"
-"$DCD" --role shard --port $SH4 --tag sm2 --free-mem 250000 --state "$T/state" >"$T/sh4.log" 2>&1 & PIDS="$PIDS $!"
-"$DCD" --role shard --port $SH5 --tag out --free-mem 450000 --state "$T/state" >"$T/sh5.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --port $SH1 --tag in  --free-mem 450000 --state "$T/state" >"$T/sh1.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --port $SH2 --tag big --free-mem 450000 --state "$T/state" >"$T/sh2.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --port $SH3 --tag sm1 --free-mem 250000 --state "$T/state" >"$T/sh3.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --port $SH4 --tag sm2 --free-mem 250000 --state "$T/state" >"$T/sh4.log" 2>&1 & PIDS="$PIDS $!"
+"$DCD" --port $SH5 --tag out --free-mem 450000 --state "$T/state" >"$T/sh5.log" 2>&1 & PIDS="$PIDS $!"
 sleep 0.8
 cat > "$T/shard.conf" <<EOF
 [llm]
@@ -691,6 +702,52 @@ OUT=$($DC -c "$T/distcomp.conf" --no-llm run 'посчитать 5*5' 2>&1)
 case "$OUT" in *"$(printf '\033[')"*) bad "в перенаправлении нет управляющих кодов" ;; *) ok "в перенаправлении нет управляющих кодов" ;; esac
 
 echo
+echo "21. роль назначает распределитель: пустая конфигурация, работают одни рабочие"
+# Суть переделки: рабочий про роль не знает вообще — он только сообщает
+# мощь. Конфигурация здесь пустая, ни одного адреса: распределитель сам
+# спрашивает сеть, собирает пул и решает, кто чем займётся.
+cat > "$T/empty.conf" <<EOF
+[llm]
+[scheduler]
+concurrency = 2
+retries     = 0
+timeout_ms  = 10000
+outdir      = $T/runs
+EOF
+OUT=$($DC -c "$T/empty.conf" --no-llm run "$GOAL" 2>&1); RC=$?
+check "рабочие найдены без конфигурации"  "$OUT" "найдено рабочих"
+check "задача выполнена целиком"           "$OUT" "Все шаги выполнены"
+check "посчитано верно"                   "$OUT" "3750"
+check "код возврата 0"                    "$RC"  "0"
+
+# а узел, которому роль не назначали, всё равно её исполнит: роль приходит
+# в теле задачи, а не в настройках узла. Ни одна роль в конфигурации не
+# описана, поэтому verify уйдёт тому же рабочему из пула.
+cat > "$T/pooled.json" <<'EOF'
+{"goal":"роль назначает распределитель","steps":[
+ {"id":"c1","role":"compute","title":"счёт","payload":"6*7","deps":[]},
+ {"id":"v1","role":"verify","title":"сверка","payload":"all","deps":["c1"]},
+ {"id":"m1","role":"memorize","title":"память","payload":"итог 42","deps":["v1"]}]}
+EOF
+OUT=$($DC -c "$T/empty.conf" -f "$T/pooled.json" run 2>&1); RC=$?
+check "вычислитель из пула"               "$OUT" "42"
+check "проверка из пула"                  "$OUT" "Все шаги выполнены"
+check "и запись в память"                  "$OUT" "-> OK"
+check "код возврата 0"                    "$RC"  "0"
+
+# а если рабочих в сети нет — сказано прямо, а не молчаливый простой
+cat > "$T/nopool.conf" <<EOF
+[llm]
+[role lonely]
+daemon = 127.0.0.1:$((BASE+9))
+[scheduler]
+timeout_ms = 3000
+retries = 0
+EOF
+OUT=$($DC -c "$T/nopool.conf" -f "$T/needsverify.json" run 2>&1); RC=$?
+check "без пула шаг некуда деть"          "$OUT" "не назначена ни одному узлу"
+check "и код возврата 4"                  "$RC"  "4"
+
 echo "-----------------------------------------"
 echo "пройдено: $PASS, упало: $FAIL"
 [ "$FAIL" -eq 0 ]

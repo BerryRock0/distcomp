@@ -89,8 +89,13 @@ int udp_pack(unsigned char type, const char *json, unsigned char **out, size_t *
 /* Как udp_pack, но для широковещательного HELLO. port — порт службы узла,
  * а не порт отправителя; free_mem и shard идут в объявление, чтобы
  * планировщик видел память устройства ещё до того, как начнёт раскладывать
- * по нему модель. */
-int udp_pack_hello(int max_body, const char *roles, const char *arch, const char *node,
+ * по нему модель.
+ *
+ * Роли в объявлении нет и не было нужды: узел сообщает только мощь, а кем он
+ * будет — решает распределитель на каждой задаче. Поле roles оставлено в
+ * теле объявления равным «*», чтобы старый планировщик не принял узел за
+ * пустой. */
+int udp_pack_hello(int max_body, const char *arch, const char *node,
                    int port, long free_mem, const char *shard, unsigned char **out,
                    size_t *out_len);
 

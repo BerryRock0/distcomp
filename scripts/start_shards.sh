@@ -9,7 +9,7 @@ pkill -f 'bin/dcd' 2>/dev/null
 sleep 1
 for i in $(seq 1 "$N"); do
   port=$((19520 + i))
-  setsid ./bin/dcd --port "$port" --role shard --free-mem "$MEM" --tag "sh$i" \
+  setsid ./bin/dcd --port "$port" --free-mem "$MEM" --tag "sh$i" \
     > "/tmp/dc/sh$i.log" 2>&1 < /dev/null &
   echo $! > "/tmp/dc/sh$i.pid"
 done
