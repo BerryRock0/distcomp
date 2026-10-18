@@ -63,6 +63,7 @@ typedef struct {
     char  shard[96];   /* описание shard-узла: «слои 2-5, вход 16, 1.2 МБ» */
     int   known;       /* capability уже получены */
     int   threads;     /* сколько потоков узел считает; 0 — не сообщил */
+    char  flavour[8];  /* heavy — держит модель, light — нет */
 
     /* Параметры от планировщика (read-only для узла) */
     int   cfg_max_body;    /* планировщик указал max_body */

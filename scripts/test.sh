@@ -793,6 +793,89 @@ if [ "$MODEL_OK" = 1 ]; then
   fi
 fi
 
+echo
+echo "23. два вида узла: тяжёлый и лёгкий"
+# Разница не в размере буфера, а в том, что узел умеет. Лёгкий не тащит
+# движок модели и честно отдаёт free_mem = 0, поэтому распределитель сам
+# не выберет его под слои, а если задача придёт — откажет внятно.
+HEAVY=$(stat -c%s "$DCD")
+LIGHT=$(stat -c%s ./bin/dcd-lite)
+if [ "$LIGHT" -lt "$HEAVY" ]; then
+  ok "лёгкий заметно меньше тяжёлого ($LIGHT против $HEAVY байт)"
+else
+  bad "лёгкий меньше тяжёлого" "$LIGHT / $HEAVY"
+fi
+
+check "лёгкий не тащит модель"           "$(cat "$T/lite.log")" "модель не помещается"
+check "у лёгкого ноль памяти под веса"   "$(cat "$T/lite.log")" "под модель 0 байт"
+
+# лёгкий считает
+cat > "$T/light.json" <<'EOF'
+{"goal":"лёгкий узел","steps":[
+ {"id":"c1","role":"compute","title":"счёт","payload":"9*8","deps":[]}]}
+EOF
+OUT=$($DC -c "$T/lite.conf" -f "$T/light.json" run 2>&1)
+check "лёгкий считает выражения"         "$OUT" "72"
+
+# лёгкий отказывает в модели внятно, а не «неизвестная роль». Роль shard
+# здесь объявлена: иначе дело остановится раньше, на «шаг некуда назначить»,
+# и до отказа самого узла мы просто не дойдём.
+cat > "$T/light_shard.conf" <<EOF
+[role shard]
+daemon = 127.0.0.1:$LITE
+[scheduler]
+retries = 0
+timeout_ms = 3000
+EOF
+cat > "$T/light_shard.json" <<'EOF'
+{"goal":"лёгкий и модель","steps":[
+ {"id":"s1","role":"shard","title":"модель","payload":"info","deps":[]}]}
+EOF
+OUT=$($DC -c "$T/light_shard.conf" -f "$T/light_shard.json" run 2>&1)
+check "и внятно отказывает в модели"      "$OUT" "это лёгкий узел"
+check "и подсказывает, что делать"        "$OUT" "тяжёлый узел"
+
+# планировщик видит вид узла — иначе «свободно 0 байт» выглядит как поломка
+OUT=$($DC -c "$T/lite.conf" check 2>&1)
+check "check помечает лёгкий узел"        "$OUT" "лёгкий"
+OUT=$($DC -c "$T/distcomp.conf" check 2>&1)
+check_absent "тяжёлый узел не помечен как лёгкий" "$OUT" "лёгкий"
+check "тяжёлый память под веса отдаёт"    "$OUT" "под модель"
+
+echo
+echo "24. сборка под архитектуры"
+# make arches работает всегда и показывает, что есть и чего не хватает
+OUT=$(make --no-print-directory arches 2>&1)
+check "список архитектур печатается"      "$OUT" "aarch64"
+check "своя архитектура в списке"         "$OUT" "x86_64"
+# для отсутствующего компилятора — внятная ошибка, а не «command not found»
+OUT=$(make --no-print-directory aarch64 2>&1); RC=$?
+if printf '%s' "$OUT" | grep -q "компилятора нет" && [ "$RC" -ne 0 ]; then
+  ok "нет компилятора — внятная ошибка с подсказкой"
+else
+  bad "нет компилятора — внятная ошибка" "$(printf '%s' "$OUT" | head -1)"
+fi
+# то, что собрать можно, собирается: своя архитектура кладётся в bin/<arch>/
+if make --no-print-directory "$(gcc -dumpmachine | sed 's/-.*//')" >/dev/null 2>&1; then
+  HOSTA=$(gcc -dumpmachine | sed 's/-.*//')
+  if [ -f "bin/$HOSTA/dcd" ] && [ -f "bin/$HOSTA/dcd-lite" ]; then
+    ok "своя архитектура собрана в bin/$HOSTA/ (оба вида)"
+  else
+    bad "своя архитектура собрана" "bin/$HOSTA/"
+  fi
+else
+  echo "  пропущено: $(gcc -dumpmachine | sed 's/-.*//') не собралась"
+fi
+# clean должен убирать и кросс-сборки. Проверяем «на сухую»: сам clean здесь
+# запускать нельзя — он снёс бы бинарники, на которых стоит весь этот прогон.
+OUT=$(make --no-print-directory -n clean 2>&1)
+if printf '%s\n' "$OUT" | grep -q "bin/aarch64"; then
+  ok "clean убирает и кросс-сборки"
+else
+  bad "clean убирает и кросс-сборки" "в clean нет bin/<arch>"
+fi
+
+echo
 echo "-----------------------------------------"
 echo "пройдено: $PASS, упало: $FAIL"
 [ "$FAIL" -eq 0 ]

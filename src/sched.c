@@ -378,6 +378,7 @@ static void *worker(void *arg)
         double          mb = js_num(js_get(root, "max_body"), 0);
         double          fm = js_num(js_get(root, "free_mem"), 0);
         double          th = js_num(js_get(root, "threads"), 0);
+        const char    *fl = js_get_str(root, "flavour");
         const char    *nd = js_get_str(root, "node");
         const char    *rs = js_get_str(root, "roles");
         const char    *sh = js_get_str(root, "shard");
@@ -387,6 +388,7 @@ static void *worker(void *arg)
         }
         if (fm > 0) cap->free_mem = (long)fm;
         if (th > 0) cap->threads = (int)th;
+        if (fl) snprintf(cap->flavour, sizeof cap->flavour, "%s", fl);
         if (nd) snprintf(cap->node, sizeof cap->node, "%s", nd);
         if (rs) snprintf(cap->roles, sizeof cap->roles, "%s", rs);
         if (sh) snprintf(cap->shard, sizeof cap->shard, "%s", sh);
@@ -786,6 +788,7 @@ static int node_probe(dc_config *cfg, dc_endpoint *ep, int *ms_out, dc_capabilit
         /* сколько памяти узел отдаёт под веса модели */
         double fm = js_num(js_get(js_root(d), "free_mem"), 0);
         double th = js_num(js_get(js_root(d), "threads"), 0);
+        const char *fl = js_get_str(js_root(d), "flavour");
         const char *sh = js_get_str(js_root(d), "shard");
         if (mb > 0) {
             cap->max_body = (int)mb;
@@ -793,6 +796,7 @@ static int node_probe(dc_config *cfg, dc_endpoint *ep, int *ms_out, dc_capabilit
         }
         if (fm > 0) cap->free_mem = (long)fm;
         if (th > 0) cap->threads = (int)th;
+        if (fl) snprintf(cap->flavour, sizeof cap->flavour, "%s", fl);
         if (rs) snprintf(cap->roles, sizeof cap->roles, "%s", rs);
         if (ar) snprintf(cap->arch, sizeof cap->arch, "%s", ar);
         if (nd) snprintf(cap->node, sizeof cap->node, "%s", nd);
@@ -856,6 +860,7 @@ int sched_probe(dc_config *cfg, dc_node_status *out, int max)
             ns->max_body = r->eps[j].cap.max_body;
             ns->free_mem = r->eps[j].cap.free_mem;
             snprintf(ns->arch, sizeof ns->arch, "%s", r->eps[j].cap.arch);
+            snprintf(ns->flavour, sizeof ns->flavour, "%s", r->eps[j].cap.flavour);
             snprintf(ns->shard, sizeof ns->shard, "%s", r->eps[j].cap.shard);
         }
     }
@@ -905,6 +910,10 @@ int sched_check(dc_config *cfg)
             printf("    %s  ", r->eps[j].url);
             printf("живой, %3d мс", ms);
             if (cap.known) printf(", лимит тела %d байт", cap.max_body);
+            /* Вид узла: тяжёлый держит модель, лёгкий — нет. Печатаем
+             * только лёгкий: тяжёлый у всех, и слово в каждой строке шумит. */
+            if (cap.flavour[0] && strcmp(cap.flavour, "light") == 0)
+                printf(", лёгкий");
             if (cap.threads > 0) {
                 int a = cap.threads % 10, b = cap.threads % 100;
                 const char *w = (a == 1 && b != 11) ? "поток"
