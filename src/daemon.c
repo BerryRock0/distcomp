@@ -5,6 +5,7 @@
 #include "udp.h"
 #include "tcp.h"
 #include "dtn.h"
+#include "thread.h"
 #include "util.h"
 
 #include <arpa/inet.h>
@@ -101,6 +102,7 @@
 typedef struct {
     int  port;
     int  max_body;
+    int  threads;          /* сколько ядер узел отдаёт под счёт; 0 — все */
     char tag[32];
     char state_dir[256];
     long served;
@@ -1199,6 +1201,9 @@ static void json_pong(buf_t *b)
     badd_json(b, DC_ARCH);
     badd(b, ",\"max_body\":");
     badd_u(b, (unsigned long)N.max_body);
+    /* сколько ядер узел считает: по этому видно, что он не простаивает */
+    badd(b, ",\"threads\":");
+    badd_u(b, (unsigned long)tp_threads());
     /* сколько памяти отдаём под веса модели и что уже держим. Лёгкий узел
      * не держит модель вовсе, поэтому честно отдаёт ноль: раскладка модели
      * выбирает по free_mem, и ноль означает «сюда класть нечего». */
@@ -1233,6 +1238,16 @@ static void send_error(int fd, const struct sockaddr_in *to, const char *msg)
 /* Применяет параметры конфигурации от планировщика.
  * Планировщик передаёт их в PING-запросе, чтобы узел мог настроить себя
  * (max_body, hello_interval, транспорт и т.д.) без ручного запуска с флагами. */
+/* «1 поток», «2 потока», «5 потоков» — число неуклюжее, а читать его
+ * будут часто: в строке запуска, в объявлении и в dcctl check. */
+static const char *plural_threads(int n)
+{
+    int a = n % 10, b = n % 100;
+    if (a == 1 && b != 11) return "поток";
+    if (a >= 2 && a <= 4 && !(b >= 12 && b <= 14)) return "потока";
+    return "потоков";
+}
+
 static void apply_scheduler_config(const char *json)
 {
     if (!json || !*json) return;
@@ -1245,6 +1260,7 @@ static void apply_scheduler_config(const char *json)
     double mb = js_num(js_get(root, "cfg_max_body"), 0);
     double fm = js_num(js_get(root, "cfg_free_mem"), 0);
     double hs = js_num(js_get(root, "cfg_hello_secs"), 0);
+    double tn = js_num(js_get(root, "cfg_threads"), -1);
     double ut = js_num(js_get(root, "cfg_use_tcp"), 0);
     double ud = js_num(js_get(root, "cfg_use_dtn"), 0);
     const char *tag = js_get_str(root, "cfg_tag");
@@ -1265,6 +1281,14 @@ static void apply_scheduler_config(const char *json)
          * разбирает, а печатал спецификацию дословно. */
         dprint("планировщик: hello_interval = %d\n", (int)hs);
         /* Применяется при следующем HELLO — здесь только запоминаем */
+    }
+    /* threads: 0 значит «все ядра», поэтому отсекаем только минус — так
+     * «не задан» отличается от «считать на всю машину». */
+    if (tn >= 0) {
+        N.threads = (int)tn;
+        tp_set(N.threads);
+        dprint("планировщик: threads = %d %s\n", N.threads,
+               plural_threads(N.threads));
     }
     if (ut >= 0) {
         N.use_tcp = (int)ut;
@@ -1333,6 +1357,8 @@ static void build_reply(const req_t *r, buf_t *res)
     badd_json(res, N.tag);
     badd(res, ",\"max_body\":");
     badd_u(res, (unsigned long)N.max_body);
+    badd(res, ",\"threads\":");
+    badd_u(res, (unsigned long)tp_threads());
     badd(res, ",\"free_mem\":");
     badd_u(res, (unsigned long)N.free_mem);
     {
@@ -1506,7 +1532,8 @@ static void broadcast_hello(void)
     shard_describe(sdesc, sizeof sdesc);
     unsigned char *d = NULL;
     size_t         dl = 0;
-    if (udp_pack_hello(N.max_body, DC_ARCH, N.tag, N.port, N.free_mem, sdesc, &d, &dl) != 0)
+    if (udp_pack_hello(N.max_body, DC_ARCH, N.tag, N.port, N.free_mem, tp_threads(), sdesc,
+                          &d, &dl) != 0)
         return;
 
     /* из эфемерного сокета: адрес источника объявления ничего не значит,
@@ -1557,6 +1584,11 @@ static void usage(const char *prog)
     dprint("поэтому объявлять её здесь не нужно: узел исполняет ту, что пришла\n");
     dprint("в задании. Настраивать надо только мощь, а не «кем я буду».\n");
     dprint("\n");
+    dprint("  --threads N  сколько ядер отдать под счёт. 0 (по умолчанию) — все\n");
+    dprint("               свободные: тяжёлой ноде незачем беречь их впустую,\n");
+    dprint("               на 16 ядрах это до 6 раз быстрее одного. 1 — как было.\n");
+    dprint("               Считает только узел с моделью; считающий выражения\n");
+    dprint("               узел с простым счётом в потоках не нуждается.\n");
     dprint("  --max-body   сколько байт тела узел примет (планировщик не пришлёт\n");
     dprint("               больше; по умолчанию %d)\n", DC_MAX_BODY);
     dprint("  --free-mem   сколько байт весов модели узел готов держать: по этому\n");
@@ -1624,6 +1656,16 @@ int main(int argc, char **argv)
         if (strcmp(a, "--role") == 0 && i + 1 < argc) {
             dprint("--role больше не нужно: роль назначает распределитель\n");
             i++;
+        } else if (strcmp(a, "--threads") == 0 && i + 1 < argc) {
+            /* 0 — все свободные ядра, 1 — одно. Отрицательное — опечатка,
+             * а не «все ядра»: молча соглашаться здесь нельзя, узел бы
+             * просто не понял замысла. */
+            int t = atoi(argv[++i]);
+            if (t < 0) {
+                dprint("--threads не может быть отрицательным\n");
+                return 2;
+            }
+            N.threads = t;
         } else if (strcmp(a, "--port") == 0 && i + 1 < argc) {
             N.port = atoi(argv[++i]);
         } else if (strcmp(a, "--tag") == 0 && i + 1 < argc) {
@@ -1744,6 +1786,9 @@ int main(int argc, char **argv)
     scpy(mpath, sizeof mpath, N.state_dir);
     scat(mpath, sizeof mpath, "/memory.log");
     mem_count_init();
+    /* Пул потоков поднимается лениво, но задать ему размер надо до первой
+     * задачи: иначе первый запрос успеет посчитаться в один поток. */
+    tp_set(N.threads);
     mkdir(N.state_dir, 0775);
 #if DC_HAS_STREAMS
     if (N.use_dtn) {
@@ -1773,7 +1818,8 @@ int main(int argc, char **argv)
 
     const char *prog = prog_name(argv);
     dprint("%s: порт %d", prog, N.port);
-    dprint(", лимит тела %d байт, платформа %s%s", N.max_body, DC_ARCH,
+    dprint(", лимит тела %d байт, %d %s, платформа %s%s", N.max_body,
+           tp_threads(), plural_threads(tp_threads()), DC_ARCH,
            no_hello ? ", без объявления" : "");
     {
         char sdesc[96];
@@ -1794,7 +1840,8 @@ int main(int argc, char **argv)
 #endif
 
     dprint("%s: порт %d", prog_name(argv), N.port);
-    dprint(", лимит тела %d байт, платформа %s%s", N.max_body, DC_ARCH,
+    dprint(", лимит тела %d байт, %d %s, платформа %s%s", N.max_body,
+           tp_threads(), plural_threads(tp_threads()), DC_ARCH,
            no_hello ? ", без объявления" : "");
     if (N.use_tcp) dprint(", TCP%s", N.use_dtn ? "/DTN" : "");
     {

@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "thread.h"
 #include "util.h"
 
 #include <math.h>
@@ -260,27 +261,43 @@ static void rms_norm(float *dst, const float *x, const float *w, int n, float ep
     for (int i = 0; i < n; i++) dst[i] = x[i] * scale * w[i];
 }
 
-/* y[out] = sum_in W[in + out*n_in] * x[in]
- *
- * Раскладка именно такая: в ggml тензор [ne0, ne1] лежит элементом (i0, i1)
- * по адресу i0 + i1*ne0, то есть непрерывное измерение — ne0, и для весов
- * это вход. Раньше здесь стояло `row = raw + i*n_out` и суммирование
+/* Раскладка весов именно такая: в ggml тензор [ne0, ne1] лежит элементом
+ * (i0, i1) по адресу i0 + i1*ne0, то есть непрерывное измерение — ne0, и для
+ * весов это вход. Раньше здесь стояло `row = raw + i*n_out` и суммирование
  * r[j]*x[i], то есть чтение транспонированной матрицы: для квадратных
  * весов (attn_q) это незаметно, а для attn_k [ne, n_head_kv*hd] и ffn_down
  * даёт правдоподобный, но бессмысленный результат.
  *
+ * Работа однородна по выходу: y[out] — своя цепочка сложений, ни одна строка
+ * не смотрит на другую. Поэтому строки раздаются потокам, и ответ выходит
+ * побитово тот же, что в один поток: порядок сложений внутри строки не
+ * меняется, меняется только то, кто её считает. Это важно — сверка с
+ * эталоном идёт по токенам, и «почти так же» здесь не подходит. */
+
+typedef struct {
+    float             *y;
+    const gguf_tensor *w;
+    const float       *x;
+    int                n_in;
+} mv_job;
+
+/* y[out] = sum_in W[in + out*n_in] * x[in] для out из [from, to).
  * F32 и F16 читаются подряд; для квантов блок в 256 (или 32) весов
- * разворачивается в wbuf и домножается. */
-static void matvec(float *y, const gguf_tensor *w, const float *x, int n_in, int n_out,
-                   float *scratch)
+ * разворачивается в буфер на стеке и домножается. */
+static void matvec_range(void *vp, int from, int to)
 {
-    const unsigned char *raw = w->data;
-    int                 is_f16 = w->type == 1;
-    int                 is_f32 = w->type == 0;
+    mv_job              *j    = vp;
+    float               *y    = j->y;
+    const gguf_tensor   *w    = j->w;
+    const float         *x    = j->x;
+    int                  n_in = j->n_in;
+    const unsigned char *raw  = w->data;
+    int                  is_f16 = w->type == 1;
+    int                  is_f32 = w->type == 0;
 
     if (is_f32 || is_f16) {
         size_t esz = is_f16 ? 2u : 4u;
-        for (int out = 0; out < n_out; out++) {
+        for (int out = from; out < to; out++) {
             const unsigned char *col = raw + (size_t)out * (size_t)n_in * esz;
             float               acc = 0.0f;
             if (is_f16) {
@@ -298,21 +315,24 @@ static void matvec(float *y, const gguf_tensor *w, const float *x, int n_in, int
     /* кванты: блок лежит вдоль входа, блоки идут подряд по каждому out */
     size_t blk = (w->type >= 10 && w->type <= 15) ? 256u : 32u;
     if ((size_t)n_in % blk) {              /* ggml такое не порождает */
-        for (int out = 0; out < n_out; out++) y[out] = 0.0f;
+        for (int out = from; out < to; out++) y[out] = 0.0f;
         return;
     }
 
     /* Буфер на один блок: xs бывает уже 256 float (у крошечной модели), поэтому
-     * декодируем в локальный — 1 КБ стека, приемлемо и для узла. */
+     * декодируем в локальный — 1 КБ стека, приемлемо и для узла, и у каждого
+     * потока свой. */
     float blkbuf[256];
 
-    for (int out = 0; out < n_out; out++) {
+    for (int out = from; out < to; out++) {
         size_t col_elems = (size_t)out * (size_t)n_in;
         size_t nb        = (size_t)n_in / blk;
         float  acc       = 0.0f;
         for (size_t bi = 0; bi < nb; bi++) {
             if (gguf_dequant(w, blkbuf, col_elems + bi * blk, blk) != 0) {
-                y[out] = 0.0f;
+                /* весь остаток куска — нули: молчаливый выход с одним
+                 * y[out] оставил бы хвост неинициализированным */
+                for (int k = out; k < to; k++) y[k] = 0.0f;
                 return;
             }
             const float *xs = x + bi * blk;
@@ -320,6 +340,20 @@ static void matvec(float *y, const gguf_tensor *w, const float *x, int n_in, int
         }
         y[out] = acc;
     }
+}
+
+/* Ниже стольких умножений разбиение дороже самой работы: проснуться,
+ * разделать и собраться стоит больше, чем считать. Самая мелкая проекция
+ * в модели даёт около 0.3 млн, так что порог заведомо ниже нужного. */
+static void matvec(float *y, const gguf_tensor *w, const float *x, int n_in, int n_out)
+{
+    mv_job j = { y, w, x, n_in };
+    if (n_out <= 0) return;
+    if (!tp_worthwhile((long)n_in * (long)n_out)) {
+        matvec_range(&j, 0, n_out);
+        return;
+    }
+    tp_run(matvec_range, &j, n_out);
 }
 
 /* разворачивает n элементов тензора, начиная с элемента off, в float */
@@ -351,9 +385,9 @@ static void forward_layer(llm_ctx *c, llm_layer *l, int li, float *x)
     row_to_float(l->attn_norm.t, c->wn, 0, (size_t)ne);
     rms_norm(c->xb, x, c->wn, ne, c->rms_eps);
 
-    matvec(c->q, l->attn_q.t, c->xb, ne, nh * hd, c->xs);
-    matvec(c->k, l->attn_k.t, c->xb, ne, nkv * hd, c->xs);
-    matvec(c->v, l->attn_v.t, c->xb, ne, nkv * hd, c->xs);
+    matvec(c->q, l->attn_q.t, c->xb, ne, nh * hd);
+    matvec(c->k, l->attn_k.t, c->xb, ne, nkv * hd);
+    matvec(c->v, l->attn_v.t, c->xb, ne, nkv * hd);
 
     /* Смещения прибавляем после matmul и до RoPE — так же, как их считают
      * в llama.cpp. У Qwen2 без этого Q и K уезжают, и модель выдаёт мусор. */
@@ -415,19 +449,19 @@ static void forward_layer(llm_ctx *c, llm_layer *l, int li, float *x)
         }
     }
 
-    matvec(c->xb2, l->attn_out.t, c->att, nh * hd, ne, c->xs);
+    matvec(c->xb2, l->attn_out.t, c->att, nh * hd, ne);
     for (int i = 0; i < ne; i++) x[i] += c->xb2[i];
 
     /* SwiGLU: silu(gate) * up -> down */
     row_to_float(l->ffn_norm.t, c->wn, 0, (size_t)ne);
     rms_norm(c->xb, x, c->wn, ne, c->rms_eps);
-    matvec(c->xb2, l->ffn_gate.t, c->xb, ne, c->n_ff, c->xs);
-    matvec(c->xb3, l->ffn_up.t, c->xb, ne, c->n_ff, c->xs);
+    matvec(c->xb2, l->ffn_gate.t, c->xb, ne, c->n_ff);
+    matvec(c->xb3, l->ffn_up.t, c->xb, ne, c->n_ff);
     for (int j = 0; j < c->n_ff; j++) {
         float g = c->xb2[j];
         c->xb2[j] = (g / (1.0f + expf(-g))) * c->xb3[j];
     }
-    matvec(c->xb, l->ffn_down.t, c->xb2, c->n_ff, ne, c->xs);
+    matvec(c->xb, l->ffn_down.t, c->xb2, c->n_ff, ne);
     for (int i = 0; i < ne; i++) x[i] += c->xb[i];
 }
 
@@ -456,7 +490,7 @@ int llm_forward(llm_ctx *c, int token, float *out)
 
     row_to_float(c->w_norm.t, c->wn, 0, (size_t)c->n_embd);
     rms_norm(c->xb, out, c->wn, c->n_embd, c->rms_eps);
-    matvec(c->logits, c->w_out.t, c->xb, c->n_embd, c->n_vocab, c->xs);
+    matvec(c->logits, c->w_out.t, c->xb, c->n_embd, c->n_vocab);
     memcpy(out, c->xb, sizeof(float) * (size_t)c->n_embd);
     out[c->n_embd] = (float)llm_pick(c);
     return 0;

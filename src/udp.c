@@ -66,18 +66,18 @@ static uint32_t get_u32(const unsigned char *p)
  * только из доверенных источников (имя узла, платформа), кавычки не
  * экранируются. Роли в объявлении нет: узел их не знает. */
 int udp_pack_hello(int max_body, const char *arch, const char *node,
-                   int port, long free_mem, const char *shard, unsigned char **out,
-                   size_t *out_len)
+                   int port, long free_mem, int threads, const char *shard,
+                   unsigned char **out, size_t *out_len)
 {
     char json[768];
     /* port обязателен: объявление уходит с нового эфемерного сокета, и без
-     * него получатель не узнал бы, куда стучаться. free_mem и shard идут в
-     * объявление, чтобы планировщик видел память устройства ещё до того, как
-     * начнёт раскладывать по нему модель. */
+     * него получатель не узнал бы, куда стучаться. threads идёт сюда,
+     * чтобы планировщик видел загруженность машины ещё до первого PING. */
     snprintf(json, sizeof json,
              "{\"role\":\"*\",\"node\":\"%s\",\"arch\":\"%s\",\"port\":%d,"
-             "\"max_body\":%d,\"free_mem\":%ld,\"shard\":\"%s\",\"proto\":%d}",
-             node ? node : "", arch ? arch : "", port, max_body, free_mem,
+             "\"max_body\":%d,\"free_mem\":%ld,\"threads\":%d,\"shard\":\"%s\","
+             "\"proto\":%d}",
+             node ? node : "", arch ? arch : "", port, max_body, free_mem, threads,
              shard ? shard : "", DC_UDP_VERSION);
     return udp_pack(DC_MSG_HELLO, json, out, out_len);
 }
