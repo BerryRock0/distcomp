@@ -32,6 +32,9 @@ typedef struct {
     long  pool_bytes;    /* --pool-bytes: размер пула весов модели на узле */
     long  free_mem;      /* --free-mem: память под веса модели */
     int   hello_secs;    /* --hello-interval: интервал broadcast HELLO */
+    int   threads;       /* --threads: сколько ядер узел отдаёт под модель.
+                          * 0 — все свободные (обычно и надо), 1 — одно:
+                          * на тяжёлом стенде это вшестеро быстрее */
     int   use_tcp;       /* --tcp: слушать TCP порт */
     int   use_dtn;       /* --dtn: DTN поверх TCP */
     char *dtn_queue;     /* --dtn-queue: каталог очереди DTN */

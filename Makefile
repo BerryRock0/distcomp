@@ -14,7 +14,8 @@ BIN  := bin
 COMMON_SRC := $(SRC)/util.c $(SRC)/json.c $(SRC)/conf.c \
               $(SRC)/plan.c $(SRC)/llm.c $(SRC)/sched.c $(SRC)/expr.c $(SRC)/udp.c \
               $(SRC)/tcp.c $(SRC)/dtn.c $(SRC)/xport.c $(SRC)/shard.c \
-              $(SRC)/tty.c $(SRC)/gguf.c $(SRC)/engine.c $(SRC)/tok.c
+              $(SRC)/tty.c $(SRC)/gguf.c $(SRC)/engine.c $(SRC)/tok.c \
+              $(SRC)/thread.c
 COMMON_OBJ := $(COMMON_SRC:$(SRC)/%.c=$(BUILD)/%.o)
 
 # shard.c попал в общие объекты потому, что планирование зовёт его движок:
@@ -96,7 +97,8 @@ lite: $(LITE)
 # и делается, — маленький бинарник с одним циклом и одним сокетом.
 $(LITE): $(BUILD)/daemon_lite.o $(BUILD)/util_lite.o $(BUILD)/json_lite.o \
          $(BUILD)/conf_lite.o $(BUILD)/expr_lite.o $(BUILD)/udp_lite.o \
-         $(BUILD)/gguf_lite.o $(BUILD)/engine_lite.o $(BUILD)/tok_lite.o | $(BIN)
+         $(BUILD)/gguf_lite.o $(BUILD)/engine_lite.o $(BUILD)/tok_lite.o \
+         $(BUILD)/thread_lite.o | $(BIN)
 	$(CC) $(LITEFLAGS) -Wl,--gc-sections $(LDFLAGS) -o $@ $^ -lm
 
 $(BUILD)/%_lite.o: $(SRC)/%.c | $(BUILD)

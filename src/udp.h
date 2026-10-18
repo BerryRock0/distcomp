@@ -62,11 +62,13 @@ typedef struct {
     char  node[32];    /* имя узла */
     char  shard[96];   /* описание shard-узла: «слои 2-5, вход 16, 1.2 МБ» */
     int   known;       /* capability уже получены */
+    int   threads;     /* сколько потоков узел считает; 0 — не сообщил */
 
     /* Параметры от планировщика (read-only для узла) */
     int   cfg_max_body;    /* планировщик указал max_body */
     long  cfg_free_mem;    /* планировщик указал free_mem */
     int   cfg_hello_secs;  /* планировщик указал интервал HELLO */
+    int   cfg_threads;     /* планировщик указал число потоков */
     int   cfg_use_tcp;     /* планировщик указал использовать TCP */
     int   cfg_use_dtn;     /* планировщик указал использовать DTN */
     char  cfg_tag[32];     /* планировщик указал имя узла */
@@ -96,8 +98,8 @@ int udp_pack(unsigned char type, const char *json, unsigned char **out, size_t *
  * теле объявления равным «*», чтобы старый планировщик не принял узел за
  * пустой. */
 int udp_pack_hello(int max_body, const char *arch, const char *node,
-                   int port, long free_mem, const char *shard, unsigned char **out,
-                   size_t *out_len);
+                   int port, long free_mem, int threads, const char *shard,
+                   unsigned char **out, size_t *out_len);
 
 /* Разбирает дейтаграмму. body указывает внутрь buf — копировать не нужно. */
 int udp_unpack(const unsigned char *buf, size_t len, dc_msg *msg, char *err, size_t errlen);
