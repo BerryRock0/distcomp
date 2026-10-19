@@ -59,8 +59,11 @@ dc_config *conf_new(void)
     cfg->timeout_ms   = 60000;
     cfg->backoff_ms   = 500;
     cfg->outdir       = xstrdup("runs");
+    cfg->upload_dir   = xstrdup("uploads");
     /* Параметры демона по умолчанию (как в dcd) */
     cfg->node_params.hello_secs = 10;  /* DC_HELLO_SECS */
+    /* 0 — «все свободные ядра»: тяжёлой ноде незачем беречь их впустую */
+    cfg->node_params.threads    = 0;
     return cfg;
 }
 
@@ -71,6 +74,7 @@ void conf_free(dc_config *cfg)
     free(cfg->payload_mode);
     free(cfg->chat_system);
     free(cfg->outdir);
+    free(cfg->upload_dir);
     free(cfg->node_params.tag);
     free(cfg->node_params.state_dir);
     free(cfg->node_params.dtn_queue);
@@ -106,6 +110,9 @@ int conf_role_add_ep(dc_role *r, const char *url)
         if (strcmp(r->eps[i].url, url) == 0) return 0;
     r->eps[r->nep].url = xstrdup(url);
     r->eps[r->nep].inflight = 0;
+    /* -1 — «про этот узел не сказали». Отличать надо: ноль у threads означает
+     * «считай на всех ядрах» и вовсе не то же, что «параметра нет». */
+    r->eps[r->nep].params.threads = -1;
     r->nep++;
     return 0;
 }
@@ -125,6 +132,7 @@ dc_config *conf_clone(const dc_config *src)
     set_str(&d->payload_mode, src->payload_mode);
     set_str(&d->chat_system, src->chat_system);
     set_str(&d->outdir, src->outdir);
+    set_str(&d->upload_dir, src->upload_dir);
     d->n_ctx        = src->n_ctx;
     d->max_new      = src->max_new;
     d->chat_history = src->chat_history;
@@ -141,6 +149,7 @@ dc_config *conf_clone(const dc_config *src)
     d->node_params.pool_bytes = src->node_params.pool_bytes;
     d->node_params.free_mem   = src->node_params.free_mem;
     d->node_params.hello_secs = src->node_params.hello_secs;
+    d->node_params.threads    = src->node_params.threads;
     d->node_params.use_tcp    = src->node_params.use_tcp;
     d->node_params.use_dtn    = src->node_params.use_dtn;
 
@@ -160,6 +169,7 @@ dc_config *conf_clone(const dc_config *src)
             r->eps[r->nep - 1].params.pool_bytes = src->roles[i].eps[j].params.pool_bytes;
             r->eps[r->nep - 1].params.free_mem   = src->roles[i].eps[j].params.free_mem;
             r->eps[r->nep - 1].params.hello_secs = src->roles[i].eps[j].params.hello_secs;
+            r->eps[r->nep - 1].params.threads    = src->roles[i].eps[j].params.threads;
             r->eps[r->nep - 1].params.use_tcp    = src->roles[i].eps[j].params.use_tcp;
             r->eps[r->nep - 1].params.use_dtn    = src->roles[i].eps[j].params.use_dtn;
         }
@@ -288,6 +298,7 @@ dc_config *conf_load(const char *path, char *err, size_t errlen)
                                 else if (str_ieq(k, "pool_bytes") || str_ieq(k, "pool-bytes")) ep->params.pool_bytes = strtol(v, NULL, 10);
                                 else if (str_ieq(k, "free_mem") || str_ieq(k, "free-mem")) ep->params.free_mem = strtol(v, NULL, 10);
                                 else if (str_ieq(k, "hello_interval") || str_ieq(k, "hello-interval")) ep->params.hello_secs = (int)strtol(v, NULL, 10);
+                                else if (str_ieq(k, "threads")) ep->params.threads = (int)strtol(v, NULL, 10);
                                 else if (str_ieq(k, "tcp")) ep->params.use_tcp = atoi(v) != 0;
                                 else if (str_ieq(k, "dtn")) ep->params.use_dtn = atoi(v) != 0;
                                 else if (str_ieq(k, "dtn_queue") || str_ieq(k, "dtn-queue")) set_str(&ep->params.dtn_queue, v);
@@ -321,6 +332,7 @@ dc_config *conf_load(const char *path, char *err, size_t errlen)
             else if (str_ieq(key, "timeout_ms"))  cfg->timeout_ms = strtol(value, NULL, 10);
             else if (str_ieq(key, "backoff_ms"))  cfg->backoff_ms = strtol(value, NULL, 10);
             else if (str_ieq(key, "outdir"))      set_str(&cfg->outdir, value);
+            else if (str_ieq(key, "upload_dir"))   set_str(&cfg->upload_dir, value);
             else log_debug("неизвестный ключ scheduler.%s", key);
         } else if (str_ieq(section, "node")) {
             /* Глобальные параметры демона для всех узлов */
@@ -335,6 +347,7 @@ dc_config *conf_load(const char *path, char *err, size_t errlen)
             else if (str_ieq(key, "free-mem"))  cfg->node_params.free_mem = strtol(value, NULL, 10);
             else if (str_ieq(key, "hello_interval")) cfg->node_params.hello_secs = (int)strtol(value, NULL, 10);
             else if (str_ieq(key, "hello-interval")) cfg->node_params.hello_secs = (int)strtol(value, NULL, 10);
+            else if (str_ieq(key, "threads")) cfg->node_params.threads = (int)strtol(value, NULL, 10);
             else if (str_ieq(key, "tcp"))       cfg->node_params.use_tcp = atoi(value) != 0;
             else if (str_ieq(key, "dtn"))       cfg->node_params.use_dtn = atoi(value) != 0;
             else if (str_ieq(key, "dtn_queue")) set_str(&cfg->node_params.dtn_queue, value);
@@ -394,6 +407,12 @@ int conf_save_example(const char *path)
         "#                              # Уже работающий узел пул не меняет —\n"
         "#                              # применяется при перезапуске.\n"
         "# hello_interval = 10              # интервал broadcast HELLO (сек, 0 = выкл)\n"
+        "# threads       = 0               # сколько ядер отдать под счёт:\n"
+        "#                              # 0 (по умолчанию) — все свободные.\n"
+        "#                              # Тяжёлой ноде незачем беречь их\n"
+        "#                              # впустую: на 16 ядрах считает\n"
+        "#                              # вшестеро быстрее одного. 1 — как\n"
+        "#                              # было, если ядер не надо делить.\n"
         "# tcp           = 0               # слушать TCP порт\n"
         "# dtn           = 0               # DTN поверх TCP\n"
         "# dtn_queue     = state/dtn       # каталог очереди DTN\n"
@@ -427,7 +446,8 @@ int conf_save_example(const char *path)
         "retries     = 2\n"
         "timeout_ms  = 60000\n"
         "backoff_ms  = 500\n"
-        "outdir      = runs\n",
+        "outdir      = runs\n"
+        "upload_dir  = uploads            # сюда панель складывает загруженные файлы\n",
         ROLE_SHARD, ROLE_COMPUTE, ROLE_VERIFY, ROLE_MEMORIZE, ROLE_SHARD);
     fclose(f);
     return 0;
@@ -448,6 +468,9 @@ dc_node_params *conf_effective_params(const dc_config *cfg, const dc_endpoint *e
     eff.pool_bytes = (p && p->pool_bytes > 0) ? p->pool_bytes : g->pool_bytes;
     eff.free_mem   = (p && p->free_mem > 0)   ? p->free_mem   : g->free_mem;
     eff.hello_secs = (p && p->hello_secs > 0) ? p->hello_secs : g->hello_secs;
+    /* Ноль у threads — осмысленное значение («все ядра»), поэтому здесь
+     * знаком именно -1: не задан узел — берём общее из [node]. */
+    eff.threads    = (p && p->threads >= 0) ? p->threads : g->threads;
     eff.use_tcp    = (p && p->use_tcp)    ? p->use_tcp    : g->use_tcp;
     eff.use_dtn    = (p && p->use_dtn)    ? p->use_dtn    : g->use_dtn;
 
@@ -513,6 +536,14 @@ char *conf_launch_cmd(const dc_config *cfg, const char *role, const dc_endpoint 
         snprintf(buf, sizeof buf, "%ld", p->free_mem);
         sb_add(&b, " --free-mem ");
         sb_add(&b, buf);
+    }
+    /* Всегда пишем: ноль означает «все ядра», и читать команду должно быть
+     * видно, что запускается именно тяжёлый, а не облегчённый узел. */
+    {
+        char tbuf[16];
+        snprintf(tbuf, sizeof tbuf, "%d", p->threads);
+        sb_add(&b, " --threads ");
+        sb_add(&b, tbuf);
     }
     if (p->hello_secs > 0) {
         char buf[16];

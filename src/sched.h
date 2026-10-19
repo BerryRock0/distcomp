@@ -15,6 +15,7 @@ typedef struct {
     long free_mem;     /* сколько байт под веса модели узел отдаёт */
     char shard[96];    /* что узел уже держит из модели */
     char arch[48];     /* платформа узла: x86_64, aarch64, arm… */
+    char flavour[8];   /* heavy — держит модель, light — нет */
     char detail[256];
 } dc_node_status;
 

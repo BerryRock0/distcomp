@@ -45,7 +45,7 @@ static void lock(runner *r)   { pthread_mutex_lock(&r->mu); }
 static void unlock(runner *r) { pthread_mutex_unlock(&r->mu); }
 
 /* Определена ниже, вместе с остальной проверкой узлов. */
-static int node_probe(dc_endpoint *ep, int *ms_out, dc_capability *cap,
+static int node_probe(dc_config *cfg, dc_endpoint *ep, int *ms_out, dc_capability *cap,
                        char *err, size_t errlen);
 
 /* Опрос всех узлов сразу, параллельно: последовательный обход добавил бы
@@ -64,7 +64,7 @@ static void *probe_one(void *arg)
 
     char err[512] = {0};
     int  ms = 0;
-    node_probe(e, &ms, &e->cap, err, sizeof err);
+    node_probe(a->cfg, e, &ms, &e->cap, err, sizeof err);
     return NULL;
 }
 
@@ -377,6 +377,8 @@ static void *worker(void *arg)
         dc_capability *cap = &j->ep->cap;
         double          mb = js_num(js_get(root, "max_body"), 0);
         double          fm = js_num(js_get(root, "free_mem"), 0);
+        double          th = js_num(js_get(root, "threads"), 0);
+        const char    *fl = js_get_str(root, "flavour");
         const char    *nd = js_get_str(root, "node");
         const char    *rs = js_get_str(root, "roles");
         const char    *sh = js_get_str(root, "shard");
@@ -385,6 +387,8 @@ static void *worker(void *arg)
             cap->known = 1;
         }
         if (fm > 0) cap->free_mem = (long)fm;
+        if (th > 0) cap->threads = (int)th;
+        if (fl) snprintf(cap->flavour, sizeof cap->flavour, "%s", fl);
         if (nd) snprintf(cap->node, sizeof cap->node, "%s", nd);
         if (rs) snprintf(cap->roles, sizeof cap->roles, "%s", rs);
         if (sh) snprintf(cap->shard, sizeof cap->shard, "%s", sh);
@@ -728,7 +732,7 @@ void sched_print_plan(const plan *p, const dc_config *cfg)
  *
  * Транспорт определяется по схеме адреса узла: udp://, tcp://, dtn://.
  */
-static int node_probe(dc_endpoint *ep, int *ms_out, dc_capability *cap,
+static int node_probe(dc_config *cfg, dc_endpoint *ep, int *ms_out, dc_capability *cap,
                       char *err, size_t errlen)
 {
     char  perr[512] = {0};
@@ -737,15 +741,24 @@ static int node_probe(dc_endpoint *ep, int *ms_out, dc_capability *cap,
     /* Если у узла есть параметры в конфигурации — добавляем их в PING,
      * чтобы узел мог применить их (например, max_body или hello_interval) */
     char ping_json[512];
+    /* threads в PING всегда: -1 означает «не трогай», 0 — «все ядра»,
+     * а узлу тяжелее, чем самому угадывать, сколько ему считать. */
+    int cfg_thr = -1;
+    if (ep) {
+        const dc_node_params *np = conf_effective_params(cfg, ep);
+        cfg_thr = np->threads;
+    }
     if (ep && (ep->params.max_body > 0 || ep->params.hello_secs > 0 ||
-               ep->params.use_tcp || ep->params.use_dtn)) {
+               ep->params.use_tcp || ep->params.use_dtn || cfg_thr >= 0)) {
         snprintf(ping_json, sizeof ping_json,
                  "{\"role\":\"ping\",\"cfg_max_body\":%d,\"cfg_free_mem\":%ld,"
-                 "\"cfg_hello_secs\":%d,\"cfg_use_tcp\":%d,\"cfg_use_dtn\":%d}",
+                 "\"cfg_hello_secs\":%d,\"cfg_use_tcp\":%d,\"cfg_use_dtn\":%d,"
+                 "\"cfg_threads\":%d}",
                  ep->params.max_body, ep->params.free_mem,
-                 ep->params.hello_secs, ep->params.use_tcp, ep->params.use_dtn);
+                 ep->params.hello_secs, ep->params.use_tcp, ep->params.use_dtn, cfg_thr);
     } else {
-        snprintf(ping_json, sizeof ping_json, "{\"role\":\"ping\"}");
+        snprintf(ping_json, sizeof ping_json,
+                 "{\"role\":\"ping\",\"cfg_threads\":%d}", cfg_thr);
     }
 
     long t0 = now_ms();
@@ -774,12 +787,16 @@ static int node_probe(dc_endpoint *ep, int *ms_out, dc_capability *cap,
         const char *nd = js_get_str(js_root(d), "node");
         /* сколько памяти узел отдаёт под веса модели */
         double fm = js_num(js_get(js_root(d), "free_mem"), 0);
+        double th = js_num(js_get(js_root(d), "threads"), 0);
+        const char *fl = js_get_str(js_root(d), "flavour");
         const char *sh = js_get_str(js_root(d), "shard");
         if (mb > 0) {
             cap->max_body = (int)mb;
             cap->known = 1;
         }
         if (fm > 0) cap->free_mem = (long)fm;
+        if (th > 0) cap->threads = (int)th;
+        if (fl) snprintf(cap->flavour, sizeof cap->flavour, "%s", fl);
         if (rs) snprintf(cap->roles, sizeof cap->roles, "%s", rs);
         if (ar) snprintf(cap->arch, sizeof cap->arch, "%s", ar);
         if (nd) snprintf(cap->node, sizeof cap->node, "%s", nd);
@@ -832,7 +849,7 @@ int sched_probe(dc_config *cfg, dc_node_status *out, int max)
             }
 
             int ms = 0;
-            if (node_probe(&r->eps[j], &ms, &r->eps[j].cap, err, sizeof err) != 0) {
+            if (node_probe(cfg, &r->eps[j], &ms, &r->eps[j].cap, err, sizeof err) != 0) {
                 ns->alive = 0;
                 snprintf(ns->detail, sizeof ns->detail, "%s", err);
                 continue;
@@ -843,6 +860,7 @@ int sched_probe(dc_config *cfg, dc_node_status *out, int max)
             ns->max_body = r->eps[j].cap.max_body;
             ns->free_mem = r->eps[j].cap.free_mem;
             snprintf(ns->arch, sizeof ns->arch, "%s", r->eps[j].cap.arch);
+            snprintf(ns->flavour, sizeof ns->flavour, "%s", r->eps[j].cap.flavour);
             snprintf(ns->shard, sizeof ns->shard, "%s", r->eps[j].cap.shard);
         }
     }
@@ -882,7 +900,7 @@ int sched_check(dc_config *cfg)
             dc_capability cap;
             memset(&cap, 0, sizeof cap);
             int ms = 0;
-            if (node_probe(&r->eps[j], &ms, &cap, err, sizeof err) != 0) {
+            if (node_probe(cfg, &r->eps[j], &ms, &cap, err, sizeof err) != 0) {
                 printf("    %s", r->eps[j].url);
                 printf("  недоступен: %s\n", err);
                 bad++;
@@ -892,6 +910,17 @@ int sched_check(dc_config *cfg)
             printf("    %s  ", r->eps[j].url);
             printf("живой, %3d мс", ms);
             if (cap.known) printf(", лимит тела %d байт", cap.max_body);
+            /* Вид узла: тяжёлый держит модель, лёгкий — нет. Печатаем
+             * только лёгкий: тяжёлый у всех, и слово в каждой строке шумит. */
+            if (cap.flavour[0] && strcmp(cap.flavour, "light") == 0)
+                printf(", лёгкий");
+            if (cap.threads > 0) {
+                int a = cap.threads % 10, b = cap.threads % 100;
+                const char *w = (a == 1 && b != 11) ? "поток"
+                           : (a >= 2 && a <= 4 && !(b >= 12 && b <= 14)) ? "потока"
+                           : "потоков";
+                printf(", %d %s", cap.threads, w);
+            }
             if (cap.free_mem > 0) printf(", под модель %ld байт", cap.free_mem);
             if (cap.shard[0] && strncmp(cap.shard, "пусто", 5) != 0) printf(" [%s]", cap.shard);
             if (cap.roles[0] && strcmp(cap.roles, "*") != 0)

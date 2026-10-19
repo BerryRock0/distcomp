@@ -46,8 +46,12 @@ start_daemons() {
 
 ok()   { printf '  \033[32mПРОЙДЕН\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mУПАЛ\033[0m    %s\n' "$1"; [ $# -gt 1 ] && printf '         %s\n' "$2"; FAIL=$((FAIL+1)); }
-check(){ if printf '%s' "$2" | grep -qF -- "$3"; then ok "$1"; else bad "$1" "не нашёл «$3»"; fi; }
-check_absent(){ if printf '%s' "$2" | grep -qF -- "$3"; then bad "$1" "лишнее «$3»"; else ok "$1"; fi; }
+# Проверки идут без пайпа — через here-string. С пайпом и `pipefail` (строка
+# выше) проверка крупной строки ломалась сама: grep -q выходит сразу после
+# первого совпадения и закрывает пайп, а printf на следующей записи ловит
+# EPIPE и выходит с 141 — и pipefail объявляет провал, хотя строка на месте.
+check(){ if grep -qF -- "$3" <<<"$2"; then ok "$1"; else bad "$1" "не нашёл «$3»"; fi; }
+check_absent(){ if grep -qF -- "$3" <<<"$2"; then bad "$1" "лишнее «$3»"; else ok "$1"; fi; }
 
 start_daemons
 
@@ -71,6 +75,7 @@ retries     = 2
 timeout_ms  = 10000
 backoff_ms  = 150
 outdir      = $T/runs
+upload_dir  = $T/uploads
 EOF
 
 GOAL='посчитать стоимость закупки 1250*3, затем долю (1250*3+480)/7'
@@ -355,8 +360,12 @@ for _ in $(seq 1 60); do
   HTML=$(curl -s --max-time 2 "http://127.0.0.1:$WEB/" 2>/dev/null || true)
   # Ждём не «непустой ответ», а сам признак готовности: сокет может принять
   # соединение раньше, чем панель дослала страницу, и тогда первый непустой
-  # ответ окажется обрезанным — страница есть, а заголовка в ней нет.
-  case "$HTML" in *"<title>distcomp"*) break ;; esac
+  # ответ окажется обрезанным: страница есть, а заголовка в ней нет.
+  #
+  # Признак берём с КОНЦА страницы, а не с <title> в её начале: под нагрузкой
+  # curl успевает вернуть частично принятое тело, и по заголовку цикл вышел бы
+  # раньше времени — проверки ниже падали бы на ровном месте.
+  case "$HTML" in *"</html>"*) break ;; esac
   sleep 0.25
 done
 check "страница отдаётся"          "$HTML" "<title>distcomp"
@@ -441,6 +450,42 @@ sleep 0.2
 STATE=$(curl -s "http://127.0.0.1:$WEB/api/state" || true)
 NC=$(printf '%s' "$STATE" | grep -o "\"name\":\"compute\"" | wc -l)
 check "узел добавлен через UI"     "$STATE" '"name":"compute"'
+
+# Загрузка проектов. Содержимое — двоичное с байтами, которые в тексте
+# выглядели бы мусором: так проверка ловит обрезанный или перевёрнутый файл.
+printf 'distcomp-\001\002\377' > "$T/проект.bin"
+head -c 4096 /dev/urandom >> "$T/проект.bin"
+OUT=$(curl -s -F "file=@$T/проект.bin" "http://127.0.0.1:$WEB/api/upload" || true)
+check "файл загружен"              "$OUT" '"ok":true'
+check "имя файла в ответе"         "$OUT" 'проект'
+check "файл лежит на диске"        "$(ls "$T/uploads" 2>/dev/null)" "проект.bin"
+
+FILES=$(curl -s "http://127.0.0.1:$WEB/api/files" || true)
+check "файл виден в списке"        "$FILES" 'проект.bin'
+check "размер файла известен"      "$FILES" '"bytes":'
+
+curl -s "http://127.0.0.1:$WEB/api/files?name=%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82.bin" \
+     -o "$T/got.bin" 2>/dev/null
+if cmp -s "$T/проект.bin" "$T/got.bin"; then
+  ok "скачанный файл совпал байт в байт"
+else
+  bad "скачанный файл совпал байт в байт" "$(wc -c < "$T/got.bin") байт вместо $(wc -c < "$T/проект.bin")"
+fi
+OUT=$(curl -s -D - -o /dev/null "http://127.0.0.1:$WEB/api/files?name=%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82.bin" \
+      2>/dev/null | tr -d '\r')
+check "отдаётся как вложение"      "$OUT" "Content-Disposition: attachment"
+
+# имя файла не должно выбраться из каталога загрузок
+OUT=$(curl -s -F "file=@$T/проект.bin;filename=../побег.bin" \
+        "http://127.0.0.1:$WEB/api/upload" || true)
+check "путь в имени отклонён"      "$OUT" "недопустимое имя"
+check "файл наружу не уехал"       "$([ -e "$T/../побег.bin" ] && echo есть || echo нет)" "нет"
+
+OUT=$(curl -s -X POST "http://127.0.0.1:$WEB/api/files" -H 'Content-Type: application/json' \
+        -d '{"name":"проект.bin","op":"remove"}' || true)
+check "файл удалён"                "$OUT" '"ok":true'
+FILES=$(curl -s "http://127.0.0.1:$WEB/api/files" || true)
+check_absent "исчез из списка"     "$FILES" "проект.bin"
 
 echo
 echo "12. lite-узел (сборка для маленьких устройств)"
@@ -748,6 +793,134 @@ OUT=$($DC -c "$T/nopool.conf" -f "$T/needsverify.json" run 2>&1); RC=$?
 check "без пула шаг некуда деть"          "$OUT" "не назначена ни одному узлу"
 check "и код возврата 4"                  "$RC"  "4"
 
+echo
+echo "22. тяжёлый узел берёт все свободные ядра"
+# Раньше движок считал строго в одном потоке: машина с 16 ядрами работала
+# на одном. Теперь matvec раздаёт строки всем ядрам. Проверяем, что узел
+# этим действительно пользуется и что потоки настраиваются снаружи.
+TH=$((BASE+90))
+cat > "$T/threads.conf" <<EOF
+[node]
+threads = 3
+
+[role compute]
+daemon = 127.0.0.1:$TH
+EOF
+"$DCD" --port $TH --tag thr --state "$T/state" >"$T/thr.log" 2>&1 & PIDS="$PIDS $!"
+sleep 0.7
+check "в строке запуска видно число потоков" "$(cat "$T/thr.log")" "16 потоков"
+OUT=$($DC -c "$T/threads.conf" check 2>&1)
+check "check показывает, сколько ядер взято"  "$OUT" "3 потока"
+check "узел принял настройку из конфигурации" "$(cat "$T/thr.log")" "threads = 3 потока"
+# план уходит на узел, а узел считает — то есть пул действительно поднят
+cat > "$T/thr.json" <<'EOF'
+{"goal":"потоки","steps":[
+ {"id":"c1","role":"compute","title":"счёт","payload":"6*7","deps":[]}]}
+EOF
+OUT=$($DC -c "$T/threads.conf" -f "$T/thr.json" run 2>&1)
+check "узел с пулом потоков считает"           "$OUT" "42"
+
+# lite-узел — микроконтроллер: там потоков быть не должно вовсе
+check "lite-узел остаётся однопоточным"       "$(cat "$T/lite.log")" "1 поток"
+
+# главное: параллельный счёт обязан дать ровно тот же ответ, что и один поток
+# (тест 19 уже сверяет распределённый конвейер с локальным прогоном и numpy;
+# здесь проверяем, что многопоточность не поехала по числам)
+if [ "$MODEL_OK" = 1 ]; then
+  REF=$($DC -c "$T/shard.conf" llm prompt "$T/model.gguf" distcomp 4 2>&1 \
+        | sed -n 's/^\([0-9][0-9 ]*\)$/\1/p' | head -1)
+  OUT2=$(DC_THREADS=1 $DC -c "$T/shard.conf" llm prompt "$T/model.gguf" distcomp 4 2>&1 \
+        | sed -n 's/^\([0-9][0-9 ]*\)$/\1/p' | head -1)
+  if [ -n "$REF" ] && [ "$REF" = "$OUT2" ]; then
+    ok "потоки не меняют ни одного токена"
+  else
+    bad "потоки не меняют ни одного токена" "1 поток: $OUT2, все ядра: $REF"
+  fi
+fi
+
+echo
+echo "23. два вида узла: тяжёлый и лёгкий"
+# Разница не в размере буфера, а в том, что узел умеет. Лёгкий не тащит
+# движок модели и честно отдаёт free_mem = 0, поэтому распределитель сам
+# не выберет его под слои, а если задача придёт — откажет внятно.
+HEAVY=$(stat -c%s "$DCD")
+LIGHT=$(stat -c%s ./bin/dcd-lite)
+if [ "$LIGHT" -lt "$HEAVY" ]; then
+  ok "лёгкий заметно меньше тяжёлого ($LIGHT против $HEAVY байт)"
+else
+  bad "лёгкий меньше тяжёлого" "$LIGHT / $HEAVY"
+fi
+
+check "лёгкий не тащит модель"           "$(cat "$T/lite.log")" "модель не помещается"
+check "у лёгкого ноль памяти под веса"   "$(cat "$T/lite.log")" "под модель 0 байт"
+
+# лёгкий считает
+cat > "$T/light.json" <<'EOF'
+{"goal":"лёгкий узел","steps":[
+ {"id":"c1","role":"compute","title":"счёт","payload":"9*8","deps":[]}]}
+EOF
+OUT=$($DC -c "$T/lite.conf" -f "$T/light.json" run 2>&1)
+check "лёгкий считает выражения"         "$OUT" "72"
+
+# лёгкий отказывает в модели внятно, а не «неизвестная роль». Роль shard
+# здесь объявлена: иначе дело остановится раньше, на «шаг некуда назначить»,
+# и до отказа самого узла мы просто не дойдём.
+cat > "$T/light_shard.conf" <<EOF
+[role shard]
+daemon = 127.0.0.1:$LITE
+[scheduler]
+retries = 0
+timeout_ms = 3000
+EOF
+cat > "$T/light_shard.json" <<'EOF'
+{"goal":"лёгкий и модель","steps":[
+ {"id":"s1","role":"shard","title":"модель","payload":"info","deps":[]}]}
+EOF
+OUT=$($DC -c "$T/light_shard.conf" -f "$T/light_shard.json" run 2>&1)
+check "и внятно отказывает в модели"      "$OUT" "это лёгкий узел"
+check "и подсказывает, что делать"        "$OUT" "тяжёлый узел"
+
+# планировщик видит вид узла — иначе «свободно 0 байт» выглядит как поломка
+OUT=$($DC -c "$T/lite.conf" check 2>&1)
+check "check помечает лёгкий узел"        "$OUT" "лёгкий"
+OUT=$($DC -c "$T/distcomp.conf" check 2>&1)
+check_absent "тяжёлый узел не помечен как лёгкий" "$OUT" "лёгкий"
+check "тяжёлый память под веса отдаёт"    "$OUT" "под модель"
+
+echo
+echo "24. сборка под архитектуры"
+# make arches работает всегда и показывает, что есть и чего не хватает
+OUT=$(make --no-print-directory arches 2>&1)
+check "список архитектур печатается"      "$OUT" "aarch64"
+check "своя архитектура в списке"         "$OUT" "x86_64"
+# для отсутствующего компилятора — внятная ошибка, а не «command not found»
+OUT=$(make --no-print-directory aarch64 2>&1); RC=$?
+if printf '%s' "$OUT" | grep -q "компилятора нет" && [ "$RC" -ne 0 ]; then
+  ok "нет компилятора — внятная ошибка с подсказкой"
+else
+  bad "нет компилятора — внятная ошибка" "$(printf '%s' "$OUT" | head -1)"
+fi
+# то, что собрать можно, собирается: своя архитектура кладётся в bin/<arch>/
+if make --no-print-directory "$(gcc -dumpmachine | sed 's/-.*//')" >/dev/null 2>&1; then
+  HOSTA=$(gcc -dumpmachine | sed 's/-.*//')
+  if [ -f "bin/$HOSTA/dcd" ] && [ -f "bin/$HOSTA/dcd-lite" ]; then
+    ok "своя архитектура собрана в bin/$HOSTA/ (оба вида)"
+  else
+    bad "своя архитектура собрана" "bin/$HOSTA/"
+  fi
+else
+  echo "  пропущено: $(gcc -dumpmachine | sed 's/-.*//') не собралась"
+fi
+# clean должен убирать и кросс-сборки. Проверяем «на сухую»: сам clean здесь
+# запускать нельзя — он снёс бы бинарники, на которых стоит весь этот прогон.
+OUT=$(make --no-print-directory -n clean 2>&1)
+if printf '%s\n' "$OUT" | grep -q "bin/aarch64"; then
+  ok "clean убирает и кросс-сборки"
+else
+  bad "clean убирает и кросс-сборки" "в clean нет bin/<arch>"
+fi
+
+echo
 echo "-----------------------------------------"
 echo "пройдено: $PASS, упало: $FAIL"
 [ "$FAIL" -eq 0 ]
