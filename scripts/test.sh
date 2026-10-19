@@ -46,8 +46,12 @@ start_daemons() {
 
 ok()   { printf '  \033[32mПРОЙДЕН\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mУПАЛ\033[0m    %s\n' "$1"; [ $# -gt 1 ] && printf '         %s\n' "$2"; FAIL=$((FAIL+1)); }
-check(){ if printf '%s' "$2" | grep -qF -- "$3"; then ok "$1"; else bad "$1" "не нашёл «$3»"; fi; }
-check_absent(){ if printf '%s' "$2" | grep -qF -- "$3"; then bad "$1" "лишнее «$3»"; else ok "$1"; fi; }
+# Проверки идут без пайпа — через here-string. С пайпом и `pipefail` (строка
+# выше) проверка крупной строки ломалась сама: grep -q выходит сразу после
+# первого совпадения и закрывает пайп, а printf на следующей записи ловит
+# EPIPE и выходит с 141 — и pipefail объявляет провал, хотя строка на месте.
+check(){ if grep -qF -- "$3" <<<"$2"; then ok "$1"; else bad "$1" "не нашёл «$3»"; fi; }
+check_absent(){ if grep -qF -- "$3" <<<"$2"; then bad "$1" "лишнее «$3»"; else ok "$1"; fi; }
 
 start_daemons
 
@@ -71,6 +75,7 @@ retries     = 2
 timeout_ms  = 10000
 backoff_ms  = 150
 outdir      = $T/runs
+upload_dir  = $T/uploads
 EOF
 
 GOAL='посчитать стоимость закупки 1250*3, затем долю (1250*3+480)/7'
@@ -356,7 +361,11 @@ for _ in $(seq 1 60); do
   # Ждём не «непустой ответ», а сам признак готовности: сокет может принять
   # соединение раньше, чем панель дослала страницу, и тогда первый непустой
   # ответ окажется обрезанным: страница есть, а заголовка в ней нет.
-  case "$HTML" in *"<title>distcomp"*) break ;; esac
+  #
+  # Признак берём с КОНЦА страницы, а не с <title> в её начале: под нагрузкой
+  # curl успевает вернуть частично принятое тело, и по заголовку цикл вышел бы
+  # раньше времени — проверки ниже падали бы на ровном месте.
+  case "$HTML" in *"</html>"*) break ;; esac
   sleep 0.25
 done
 check "страница отдаётся"          "$HTML" "<title>distcomp"
@@ -441,6 +450,42 @@ sleep 0.2
 STATE=$(curl -s "http://127.0.0.1:$WEB/api/state" || true)
 NC=$(printf '%s' "$STATE" | grep -o "\"name\":\"compute\"" | wc -l)
 check "узел добавлен через UI"     "$STATE" '"name":"compute"'
+
+# Загрузка проектов. Содержимое — двоичное с байтами, которые в тексте
+# выглядели бы мусором: так проверка ловит обрезанный или перевёрнутый файл.
+printf 'distcomp-\001\002\377' > "$T/проект.bin"
+head -c 4096 /dev/urandom >> "$T/проект.bin"
+OUT=$(curl -s -F "file=@$T/проект.bin" "http://127.0.0.1:$WEB/api/upload" || true)
+check "файл загружен"              "$OUT" '"ok":true'
+check "имя файла в ответе"         "$OUT" 'проект'
+check "файл лежит на диске"        "$(ls "$T/uploads" 2>/dev/null)" "проект.bin"
+
+FILES=$(curl -s "http://127.0.0.1:$WEB/api/files" || true)
+check "файл виден в списке"        "$FILES" 'проект.bin'
+check "размер файла известен"      "$FILES" '"bytes":'
+
+curl -s "http://127.0.0.1:$WEB/api/files?name=%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82.bin" \
+     -o "$T/got.bin" 2>/dev/null
+if cmp -s "$T/проект.bin" "$T/got.bin"; then
+  ok "скачанный файл совпал байт в байт"
+else
+  bad "скачанный файл совпал байт в байт" "$(wc -c < "$T/got.bin") байт вместо $(wc -c < "$T/проект.bin")"
+fi
+OUT=$(curl -s -D - -o /dev/null "http://127.0.0.1:$WEB/api/files?name=%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82.bin" \
+      2>/dev/null | tr -d '\r')
+check "отдаётся как вложение"      "$OUT" "Content-Disposition: attachment"
+
+# имя файла не должно выбраться из каталога загрузок
+OUT=$(curl -s -F "file=@$T/проект.bin;filename=../побег.bin" \
+        "http://127.0.0.1:$WEB/api/upload" || true)
+check "путь в имени отклонён"      "$OUT" "недопустимое имя"
+check "файл наружу не уехал"       "$([ -e "$T/../побег.bin" ] && echo есть || echo нет)" "нет"
+
+OUT=$(curl -s -X POST "http://127.0.0.1:$WEB/api/files" -H 'Content-Type: application/json' \
+        -d '{"name":"проект.bin","op":"remove"}' || true)
+check "файл удалён"                "$OUT" '"ok":true'
+FILES=$(curl -s "http://127.0.0.1:$WEB/api/files" || true)
+check_absent "исчез из списка"     "$FILES" "проект.bin"
 
 echo
 echo "12. lite-узел (сборка для маленьких устройств)"

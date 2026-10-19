@@ -59,6 +59,7 @@ dc_config *conf_new(void)
     cfg->timeout_ms   = 60000;
     cfg->backoff_ms   = 500;
     cfg->outdir       = xstrdup("runs");
+    cfg->upload_dir   = xstrdup("uploads");
     /* Параметры демона по умолчанию (как в dcd) */
     cfg->node_params.hello_secs = 10;  /* DC_HELLO_SECS */
     /* 0 — «все свободные ядра»: тяжёлой ноде незачем беречь их впустую */
@@ -73,6 +74,7 @@ void conf_free(dc_config *cfg)
     free(cfg->payload_mode);
     free(cfg->chat_system);
     free(cfg->outdir);
+    free(cfg->upload_dir);
     free(cfg->node_params.tag);
     free(cfg->node_params.state_dir);
     free(cfg->node_params.dtn_queue);
@@ -130,6 +132,7 @@ dc_config *conf_clone(const dc_config *src)
     set_str(&d->payload_mode, src->payload_mode);
     set_str(&d->chat_system, src->chat_system);
     set_str(&d->outdir, src->outdir);
+    set_str(&d->upload_dir, src->upload_dir);
     d->n_ctx        = src->n_ctx;
     d->max_new      = src->max_new;
     d->chat_history = src->chat_history;
@@ -329,6 +332,7 @@ dc_config *conf_load(const char *path, char *err, size_t errlen)
             else if (str_ieq(key, "timeout_ms"))  cfg->timeout_ms = strtol(value, NULL, 10);
             else if (str_ieq(key, "backoff_ms"))  cfg->backoff_ms = strtol(value, NULL, 10);
             else if (str_ieq(key, "outdir"))      set_str(&cfg->outdir, value);
+            else if (str_ieq(key, "upload_dir"))   set_str(&cfg->upload_dir, value);
             else log_debug("неизвестный ключ scheduler.%s", key);
         } else if (str_ieq(section, "node")) {
             /* Глобальные параметры демона для всех узлов */
@@ -442,7 +446,8 @@ int conf_save_example(const char *path)
         "retries     = 2\n"
         "timeout_ms  = 60000\n"
         "backoff_ms  = 500\n"
-        "outdir      = runs\n",
+        "outdir      = runs\n"
+        "upload_dir  = uploads            # сюда панель складывает загруженные файлы\n",
         ROLE_SHARD, ROLE_COMPUTE, ROLE_VERIFY, ROLE_MEMORIZE, ROLE_SHARD);
     fclose(f);
     return 0;

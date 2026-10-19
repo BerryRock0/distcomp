@@ -6,6 +6,7 @@
 #include "util.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -19,13 +20,20 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_BODY   (1 << 20)
+/* 64 МБ: через тело запроса приходят и загружаемые файлы, а не только JSON.
+ * Буфер под тело выделяется по фактическому Content-Length, так что размер
+ * влияет только на потолок одного запроса, а не на постоянную память. */
+#define MAX_BODY   (64 << 20)
 
 /* Чат держит соединение минутами: модель загружается десятки секунд, а ответ
  * идёт по одному токену за шаг конвейера через сеть. Обычный таймаут в 30 с
  * обрывал бы поток на середине. */
 #define DC_CHAT_TIMEOUT_S 1800
 #define MAX_RUNS   64
+
+/* Сколько файлов моделей максимум отдаём в панель: каталог с моделями —
+ * обычно десяток файлов, а память под список всё равно надо где-то брать */
+#define DC_MAX_MODEL_FILES 100
 
 /* ------------------------------------------------------- реестр ------ */
 
@@ -78,6 +86,11 @@ struct dc_web {
     int              chat_ready;       /* 1 — модель загружена и готова */
     int              chat_busy;        /* 1 — идёт генерация */
     char             chat_err[512];    /* почему не загрузилась */
+
+    /* Каталог загруженных файлов. Один мьютекс на все операции с ними:
+     * загрузка, список, скачивание и удаление идут из разных потоков, и без
+     * него список мог прочитать каталог, пока в него пишут. */
+    pthread_mutex_t  up_mu;
 };
 
 /* -------------------------------------------------------- утилиты ----- */
@@ -121,7 +134,10 @@ static const char *query_param(const char *query, const char *name, char *buf, s
     return NULL;
 }
 
-static void http_reply(int fd, int status, const char *ctype, const char *body, size_t len)
+/* extra — готовые дополнительные заголовки (каждая строка с \r\n), вставляются
+ * перед Cache-Control. Нужно для Content-Disposition при скачивании файла. */
+static void http_reply_extra(int fd, int status, const char *ctype, const char *extra,
+                             const char *body, size_t len)
 {
     const char *reason = status == 200 ? "OK"
                        : status == 404 ? "Not Found"
@@ -129,14 +145,15 @@ static void http_reply(int fd, int status, const char *ctype, const char *body, 
                        : status == 409 ? "Conflict"
                        : status == 500 ? "Internal Server Error"
                                        : "Error";
-    char head[512];
+    char head[768];
     int  hn = snprintf(head, sizeof head,
                        "HTTP/1.1 %d %s\r\n"
                        "Content-Type: %s\r\n"
                        "Content-Length: %zu\r\n"
+                       "%s"
                        "Cache-Control: no-store\r\n"
                        "Connection: close\r\n\r\n",
-                       status, reason, ctype, len);
+                       status, reason, ctype, len, extra ? extra : "");
     /* snprintf вернул бы «длину без обрезки»: без клампа write читал бы
      * за пределами стекового буфера */
     if (hn < 0 || (size_t)hn >= sizeof head) hn = (int)sizeof head - 1;
@@ -152,6 +169,11 @@ static void http_reply(int fd, int status, const char *ctype, const char *body, 
         if (w <= 0) break;
         off += (size_t)w;
     }
+}
+
+static void http_reply(int fd, int status, const char *ctype, const char *body, size_t len)
+{
+    http_reply_extra(fd, status, ctype, "", body, len);
 }
 
 static void reply_json(int fd, int status, const strbuf *b)
@@ -722,6 +744,493 @@ static void api_llm(dc_web *w, int fd)
     sb_free(&b);
 }
 
+/* --------------------------------------------------------- модели ------ */
+
+typedef struct {
+    char *path;    /* путь, который уйдёт обратно в model_file */
+    char *name;    /* имя файла — то, что человек видит в списке */
+    char *real;    /* канонический путь — для отсева дубликатов */
+    long  bytes;
+} model_rec;
+
+static int model_cmp(const void *a, const void *b)
+{
+    return strcmp(((const model_rec *)a)->name, ((const model_rec *)b)->name);
+}
+
+/* .gguf в любом регистре */
+static int is_gguf_name(const char *name)
+{
+    size_t n = strlen(name);
+    return n >= 5 && strncasecmp(name + n - 5, ".gguf", 5) == 0;
+}
+
+/* Один каталог в список: только регулярные *.gguf. Каталог текущей модели
+ * и каталог демона частично пересекаются (модель обычно лежит рядом с
+ * distcomp.conf), поэтому дубликаты отсекаем по каноническому пути — иначе
+ * в списке панели дважды была бы одна и та же модель. */
+static void scan_model_dir(const char *dir, model_rec **list, int *n, int *cap)
+{
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!is_gguf_name(de->d_name)) continue;
+        char path[2048];
+        if (strcmp(dir, ".") != 0)
+            snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        else
+            snprintf(path, sizeof path, "%s", de->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        char real[2048];
+        if (!realpath(path, real)) continue;
+        int dup = 0;
+        for (int i = 0; i < *n; i++)
+            if (strcmp((*list)[i].real, real) == 0) { dup = 1; break; }
+        if (dup) continue;
+        if (*n >= *cap) {
+            if (*cap >= DC_MAX_MODEL_FILES) continue;
+            *cap *= 2;
+            if (*cap > DC_MAX_MODEL_FILES) *cap = DC_MAX_MODEL_FILES;
+            *list = xrealloc(*list, (size_t)*cap * sizeof **list);
+        }
+        model_rec *m = &(*list)[(*n)++];
+        m->path  = xstrdup(path);
+        m->name  = xstrdup(de->d_name);
+        m->real  = xstrdup(real);
+        m->bytes = (long)st.st_size;
+    }
+    closedir(d);
+}
+
+/* GET /api/models — список GGUF-файлов для селектора в панели. Ищем в
+ * каталоге, из которого запущен демон, и в каталоге текущей модели: в
+ * конфиге model_file может быть абсолютным путём в другое место. */
+static void api_models(dc_web *w, int fd)
+{
+    char modeldir[1024] = "";
+    const char *curmodel = NULL;
+    pthread_mutex_lock(&w->mu);
+    curmodel = w->cfg->model_file;
+    if (curmodel && *curmodel && strchr(curmodel, '/')) {
+        snprintf(modeldir, sizeof modeldir, "%s", curmodel);
+        char *slash = strrchr(modeldir, '/');
+        *slash = '\0';
+    }
+    pthread_mutex_unlock(&w->mu);
+
+    int  cap = 16, n = 0;
+    model_rec *list = xcalloc((size_t)cap, sizeof *list);
+
+    if (*modeldir) scan_model_dir(modeldir, &list, &n, &cap);
+    scan_model_dir(".", &list, &n, &cap);
+    qsort(list, (size_t)n, sizeof *list, model_cmp);
+
+    char curreal[2048] = "";
+    if (curmodel && *curmodel && !realpath(curmodel, curreal)) curreal[0] = '\0';
+
+    strbuf b;
+    sb_init(&b);
+    sb_add(&b, "{\"current\":");
+    sb_add_json_string(&b, curmodel ? curmodel : "");
+    sb_add(&b, ",\"models\":[");
+    for (int i = 0; i < n; i++) {
+        if (i) sb_add(&b, ",");
+        int iscur = *curreal && strcmp(list[i].real, curreal) == 0;
+        sb_add(&b, "{\"name\":");
+        sb_add_json_string(&b, list[i].name);
+        sb_add(&b, ",\"path\":");
+        sb_add_json_string(&b, list[i].path);
+        sb_printf(&b, ",\"bytes\":%ld", list[i].bytes);
+        sb_printf(&b, ",\"current\":%s}", iscur ? "true" : "false");
+    }
+    sb_add(&b, "]}");
+    reply_json(fd, 200, &b);
+    sb_free(&b);
+    for (int i = 0; i < n; i++) {
+        free(list[i].path);
+        free(list[i].name);
+        free(list[i].real);
+    }
+    free(list);
+}
+
+/* POST /api/model — смена модели из панели. Меняется живой model_file:
+ * следующий запуск плана и следующая загрузка чата берут новый файл. На
+ * диск не пишем — как и правки ролей, это действует до перезапуска демона.
+ *
+ * Чат при смене разгружается: веса лежат на узлах, и перезаливать их
+ * нужно уже для другой модели. Пока идёт генерация, менять модель
+ * нельзя — разгружать конвейер из-под текущего ответа опасно. */
+static void api_model(dc_web *w, int fd, const char *body)
+{
+    char     perr[256] = {0};
+    js_doc  *doc = js_parse(body && *body ? body : "{}", perr, sizeof perr);
+    if (!doc) {
+        reply_error(fd, 400, perr);
+        return;
+    }
+    /* копируем до освобождения документа: строка живёт внутри js_doc */
+    const char *mval = js_get_str(js_root(doc), "model");
+    char *model = xstrdup(mval ? mval : "");
+    js_doc_free(doc);
+    if (!*model) {
+        free(model);
+        reply_error(fd, 400, "не указан файл модели");
+        return;
+    }
+    if (strlen(model) >= 2048) {
+        reply_error(fd, 400, "слишком длинный путь");
+        return;
+    }
+    if (access(model, R_OK) != 0) {
+        char msg[2200];
+        snprintf(msg, sizeof msg, "файл недоступен: %s", model);
+        reply_error(fd, 400, msg);
+        return;
+    }
+
+    /* Смена model_file и разгрузка чата — в одном критическом разделе на
+     * chat_mu: между проверкой «не идёт ли генерация» и освобождением
+     * конвейера не должно быть окна — иначе генерация может начаться на
+     * конвейере, который мы тут же освободим. Пока идёт генерация, модель
+     * не меняем вообще: пусть ответ досчитается на старой, а панель
+     * повторит выбор после него.
+     *
+     * mu берём вложенно (chat_mu → mu). Обратного порядка в коде нет:
+     * все пути держат эти мьютексы раздельно, поэтому дедлока не будет. */
+    pthread_mutex_lock(&w->chat_mu);
+    if (w->chat_busy) {
+        pthread_mutex_unlock(&w->chat_mu);
+        reply_error(fd, 409, "идёт генерация ответа — смените модель после неё");
+        return;
+    }
+    pthread_mutex_lock(&w->mu);
+    free(w->cfg->model_file);
+    w->cfg->model_file = xstrdup(model);
+    pthread_mutex_unlock(&w->mu);
+    dc_infer_free(w->chat_infer);
+    w->chat_infer = NULL;
+    w->chat_ready = 0;
+    w->chat_err[0] = '\0';
+    sb_free(&w->chat_hist);
+    sb_init(&w->chat_hist);
+    pthread_mutex_unlock(&w->chat_mu);
+    log_info("модель сменена из панели: %s", model);
+
+    strbuf b;
+    sb_init(&b);
+    sb_add(&b, "{\"ok\":true,\"model\":");
+    sb_add_json_string(&b, model);
+    sb_add(&b, "}");
+    reply_json(fd, 200, &b);
+    sb_free(&b);
+    free(model);
+}
+
+/* -------------------------------------------------------- файлы ------- */
+
+/* Создаёт каталог вместе с родителями (как mkdir -p). */
+static void mkdirs(const char *path)
+{
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", path);
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(buf, 0775);
+            *p = '/';
+        }
+    }
+    mkdir(buf, 0775);
+}
+
+/* Имя файла — только basename без путей. Символы '.' и '..' запрещены,
+ * как и любые разделители путей — иначе ../etc/passwd пройдёт как имя. */
+static int safe_filename(const char *name)
+{
+    if (!name || !*name) return 0;
+    if (strchr(name, '/') || strchr(name, '\\')) return 0;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
+    if (strlen(name) > 200) return 0;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++)
+        if (*p < 0x20 || *p == 0x7F) return 0;
+    return 1;
+}
+
+/* Разбирает multipart/form-body (одна часть с файлом). Возвращает имя файла и
+ * указатель на содержимое части в теле запроса (не копируем). */
+static int parse_upload(const char *body, size_t len, const char *ctype,
+                        char *fname, size_t fsz,
+                        const char **data, size_t *dlen)
+{
+    /* граница из Content-Type: multipart/form-data; boundary=xxx */
+    const char *b = strstr(ctype, "boundary=");
+    if (!b) return -1;
+    b += 9;
+    char boundary[256];
+    size_t bl = 0;
+    while (b[bl] && b[bl] != ';' && b[bl] != '\r' && b[bl] != '\n' && bl + 1 < sizeof boundary)
+        boundary[bl] = b[bl], bl++;
+    boundary[bl] = '\0';
+    if (!bl) return -1;
+
+    /* разделитель в теле: "--boundary" */
+    char delim[280];
+    int dl = snprintf(delim, sizeof delim, "--%s", boundary);
+    if (dl < 0 || (size_t)dl >= sizeof delim) return -1;
+    if (len < (size_t)dl || memcmp(body, delim, (size_t)dl) != 0) return -1;
+
+    /* пропускаем \r\n после разделителя. Проверка длины обязательна: если тело
+     * кончилось ровно на разделителе, чтение h[1] ушло бы за его конец. */
+    const char *h = body + dl;
+    if (len - (size_t)dl >= 2 && h[0] == '\r' && h[1] == '\n') h += 2;
+    else if (len - (size_t)dl >= 1 && h[0] == '\n')      h += 1;
+
+    /* конец заголовков части — пустая строка */
+    size_t hlen = len - (size_t)(h - body);
+    const char *sep = memmem(h, hlen, "\r\n\r\n", 4);
+    if (!sep) return -1;
+
+    /* имя файла из Content-Disposition */
+    const char *fn = memmem(h, (size_t)(sep - h), "filename=\"", 10);
+    if (!fn) return -1;
+    fn += 10;
+    size_t fnl = 0;
+    while (fn[fnl] && fn[fnl] != '"' && fnl + 1 < fsz) {
+        fname[fnl] = fn[fnl];
+        fnl++;
+    }
+    fname[fnl] = '\0';
+    if (fn[fnl] != '"') return -1;
+
+    /* содержимое между пустой строкой и следующим разделителем */
+    const char *content = sep + 4;
+    char tail[290];
+    int tl = snprintf(tail, sizeof tail, "\r\n%s", delim);
+    if (tl < 0 || (size_t)tl >= sizeof tail) return -1;
+    size_t rest = len - (size_t)(content - body);
+    const char *end = memmem(content, rest, tail, (size_t)tl);
+    if (!end) return -1;
+
+    *data = content;
+    *dlen = (size_t)(end - content);
+    return 0;
+}
+
+/* POST /api/upload — загрузка одного файла (multipart, поле file). */
+static void api_upload(dc_web *w, int fd, const char *body, long blen, const char *ctype)
+{
+    char fname[256];
+    const char *data;
+    size_t dlen;
+    if (blen <= 0 || !ctype ||
+        parse_upload(body, (size_t)blen, ctype, fname, sizeof fname, &data, &dlen) != 0) {
+        reply_error(fd, 400, "не multipart/form-data или нет поля file");
+        return;
+    }
+    if (!safe_filename(fname)) {
+        reply_error(fd, 400, "недопустимое имя файла");
+        return;
+    }
+
+    char dir[1024], path[2200];
+    pthread_mutex_lock(&w->mu);
+    snprintf(dir, sizeof dir, "%s", w->cfg->upload_dir ? w->cfg->upload_dir : "uploads");
+    pthread_mutex_unlock(&w->mu);
+
+    mkdirs(dir);
+    snprintf(path, sizeof path, "%s/%s", dir, fname);
+
+    pthread_mutex_lock(&w->up_mu);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        pthread_mutex_unlock(&w->up_mu);
+        reply_error(fd, 500, "не удалось открыть файл для записи");
+        return;
+    }
+    int ok = dlen == 0 || fwrite(data, 1, dlen, f) == dlen;
+    fclose(f);
+    if (!ok) unlink(path);
+    pthread_mutex_unlock(&w->up_mu);
+    if (!ok) {
+        reply_error(fd, 500, "ошибка записи на диск");
+        return;
+    }
+
+    log_info("файл загружен: %s (%zu байт)", path, dlen);
+    strbuf b;
+    sb_init(&b);
+    sb_add(&b, "{\"ok\":true,\"name\":");
+    sb_add_json_string(&b, fname);
+    sb_printf(&b, ",\"bytes\":%zu}", dlen);
+    reply_json(fd, 200, &b);
+    sb_free(&b);
+}
+
+/* Элемент списка файлов. */
+typedef struct {
+    char  *name;
+    long   bytes;
+    time_t mtime;
+} file_rec;
+
+static int file_cmp(const void *a, const void *b)
+{
+    return strcmp(((const file_rec *)a)->name, ((const file_rec *)b)->name);
+}
+
+/* GET /api/files — список файлов или скачивание (если передан name). */
+static void api_files(dc_web *w, int fd, const char *query)
+{
+    char want[512] = {0};
+    int downloading = query && query_param(query, "name", want, sizeof want);
+
+    char dir[1024];
+    pthread_mutex_lock(&w->mu);
+    snprintf(dir, sizeof dir, "%s", w->cfg->upload_dir ? w->cfg->upload_dir : "uploads");
+    pthread_mutex_unlock(&w->mu);
+
+    if (downloading) {
+        if (!safe_filename(want)) {
+            reply_error(fd, 400, "недопустимое имя файла");
+            return;
+        }
+        char path[2200];
+        snprintf(path, sizeof path, "%s/%s", dir, want);
+
+        pthread_mutex_lock(&w->up_mu);
+        /* только обычный файл: каталог или fifo с тем же именем fopen откроет,
+         * а ftell вернёт мусор, и панель пошлёт клиенту этот мусор */
+        struct stat pst;
+        FILE *f = (stat(path, &pst) == 0 && S_ISREG(pst.st_mode)) ? fopen(path, "rb") : NULL;
+        if (!f) {
+            pthread_mutex_unlock(&w->up_mu);
+            reply_error(fd, 404, "файл не найден");
+            return;
+        }
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char *buf = xmalloc((size_t)sz + 1);
+        size_t got = sz > 0 ? fread(buf, 1, (size_t)sz, f) : 0;
+        fclose(f);
+        pthread_mutex_unlock(&w->up_mu);
+
+        /* Имя для Content-Disposition: убираем кавычки и управляющие. */
+        char disp_name[256];
+        size_t dn = 0;
+        for (const char *p = want; *p && dn + 1 < sizeof disp_name; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (c == '"' || c == '\\' || c < 0x20) continue;
+            disp_name[dn++] = (char)c;
+        }
+        disp_name[dn] = '\0';
+
+        /* 512, а не 320: имя файла бывает длинным, и заголовок не должен
+         * обрезаться — иначе браузер не поймёт имя и сохранит файл как
+         * download без расширения */
+        char extra[512];
+        snprintf(extra, sizeof extra,
+                 "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                 "X-Content-Type-Options: nosniff\r\n",
+                 disp_name);
+        http_reply_extra(fd, 200, "application/octet-stream", extra, buf, got);
+        free(buf);
+        return;
+    }
+
+    /* список файлов */
+    pthread_mutex_lock(&w->up_mu);
+    DIR *d = opendir(dir);
+    file_rec *list = NULL;
+    int n = 0, cap = 16;
+    if (d) {
+        list = xcalloc((size_t)cap, sizeof *list);
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' || de->d_name[1] == '.')) continue;
+            char path[2200];
+            snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+            struct stat st;
+            if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+            if (n >= cap) {
+                cap *= 2;
+                list = xrealloc(list, (size_t)cap * sizeof *list);
+            }
+            list[n].name  = xstrdup(de->d_name);
+            list[n].bytes = (long)st.st_size;
+            list[n].mtime = st.st_mtime;
+            n++;
+        }
+        closedir(d);
+    }
+    pthread_mutex_unlock(&w->up_mu);
+
+    qsort(list, (size_t)n, sizeof *list, file_cmp);
+
+    strbuf b;
+    sb_init(&b);
+    sb_add(&b, "{\"dir\":");
+    sb_add_json_string(&b, dir);
+    sb_add(&b, ",\"files\":[");
+    for (int i = 0; i < n; i++) {
+        if (i) sb_add(&b, ",");
+        sb_add(&b, "{\"name\":");
+        sb_add_json_string(&b, list[i].name);
+        sb_printf(&b, ",\"bytes\":%ld,\"mtime\":%ld", list[i].bytes, list[i].mtime);
+        sb_add(&b, "}");
+    }
+    sb_add(&b, "]}");
+    reply_json(fd, 200, &b);
+    sb_free(&b);
+    for (int i = 0; i < n; i++) free(list[i].name);
+    free(list);
+}
+
+/* POST /api/files — удалить файл: {"name":"x.txt","op":"remove"}. */
+static void api_file_delete(dc_web *w, int fd, const char *body)
+{
+    char perr[256] = {0};
+    js_doc *doc = js_parse(body && *body ? body : "{}", perr, sizeof perr);
+    if (!doc) {
+        reply_error(fd, 400, perr);
+        return;
+    }
+    /* копируем до освобождения документа */
+    const char *nval = js_get_str(js_root(doc), "name");
+    char *name = xstrdup(nval ? nval : "");
+    js_doc_free(doc);
+    if (!safe_filename(name)) {
+        free(name);
+        reply_error(fd, 400, "недопустимое имя файла");
+        return;
+    }
+
+    char dir[1024], path[2200];
+    pthread_mutex_lock(&w->mu);
+    snprintf(dir, sizeof dir, "%s", w->cfg->upload_dir ? w->cfg->upload_dir : "uploads");
+    pthread_mutex_unlock(&w->mu);
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+
+    pthread_mutex_lock(&w->up_mu);
+    int rc = unlink(path);
+    pthread_mutex_unlock(&w->up_mu);
+    free(name);
+    if (rc != 0) {
+        reply_error(fd, 404, "файл не найден");
+        return;
+    }
+
+    strbuf b;
+    sb_init(&b);
+    sb_add(&b, "{\"ok\":true}");
+    reply_json(fd, 200, &b);
+    sb_free(&b);
+}
+
 /* ----------------------------------------------------------------- чат --- */
 
 /* Одно событие потока: "data: {...}\n\n". Отдельные записи нужны, чтобы
@@ -973,15 +1482,24 @@ static void *conn_thread(void *arg)
     sscanf(reqline, "%15s %2047s", method, target);
 
     long content_length = 0;
+    char content_type[256] = {0};
     for (;;) {
         char line[2048];
         if (read_line(fd, line, sizeof line) < 0) goto done;
         if (!line[0]) break;
         if (strncasecmp(line, "Content-Length:", 15) == 0)
             content_length = strtol(line + 15, NULL, 10);
+        /* 13, а не 14: "Content-Type:" ровно 13 символов. С лишним байтом
+         * strncasecmp сравнил бы '\0' литерала с пробелом в строке и не
+         * сошёлся бы никогда — заголовок молча игнорировался. */
+        else if (strncasecmp(line, "Content-Type:", 13) == 0) {
+            char *v = str_trim(line + 13);
+            snprintf(content_type, sizeof content_type, "%s", v);
+        }
     }
 
     char *body = NULL;
+    long  body_len = 0;   /* сколько реально пришло, а не сколько обещали */
     if (content_length > 0) {
         if (content_length > MAX_BODY) {
             reply_error(fd, 400, "слишком большой запрос");
@@ -995,6 +1513,10 @@ static void *conn_thread(void *arg)
             got += (size_t)r;
         }
         body[got] = '\0';
+        /* Обрыв на середине не должен привести к разбору того, чего нет:
+         * за незаполненным хвостом лежит мусор из malloc, и он попал бы
+         * в загруженный файл. */
+        body_len = (long)got;
     }
 
     char path[2048];
@@ -1009,12 +1531,17 @@ static void *conn_thread(void *arg)
 
     /* маршруты строим от api_base, чтобы его можно было переопределить */
     char base[64], r_state[80], r_run[80], r_role[80], r_llm[80];
+    char r_models[80], r_model[80], r_files[80], r_upload[80];
     char r_chat[80], r_chat_reset[96], r_chat_load[96];
     snprintf(base, sizeof base, "%s", w->api_base);
     snprintf(r_state, sizeof r_state, "%s/state", base);
     snprintf(r_run, sizeof r_run, "%s/run", base);
     snprintf(r_role, sizeof r_role, "%s/role", base);
     snprintf(r_llm, sizeof r_llm, "%s/llm", base);
+    snprintf(r_models, sizeof r_models, "%s/models", base);
+    snprintf(r_model,  sizeof r_model,  "%s/model",  base);
+    snprintf(r_files,  sizeof r_files,  "%s/files",  base);
+    snprintf(r_upload, sizeof r_upload, "%s/upload", base);
     snprintf(r_chat, sizeof r_chat, "%s/chat", base);
     snprintf(r_chat_reset, sizeof r_chat_reset, "%s/chat/reset", base);
     snprintf(r_chat_load, sizeof r_chat_load, "%s/chat/load", base);
@@ -1041,6 +1568,16 @@ static void *conn_thread(void *arg)
         api_role(w, fd, body);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, r_llm) == 0) {
         api_llm(w, fd);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, r_models) == 0) {
+        api_models(w, fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, r_model) == 0) {
+        api_model(w, fd, body);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, r_files) == 0) {
+        api_files(w, fd, query);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, r_files) == 0) {
+        api_file_delete(w, fd, body);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, r_upload) == 0) {
+        api_upload(w, fd, body, body_len, content_type);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, r_chat) == 0) {
         api_chat_state(w, fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, r_chat) == 0) {
@@ -1091,6 +1628,7 @@ dc_web *web_start(dc_config *cfg, const char *host, int port, const char *api_ba
     pthread_mutex_init(&w->mu, NULL);
     pthread_mutex_init(&w->run_mu, NULL);
     pthread_mutex_init(&w->chat_mu, NULL);
+    pthread_mutex_init(&w->up_mu, NULL);
     sb_init(&w->chat_hist);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1180,5 +1718,6 @@ void web_free(dc_web *w)
     pthread_mutex_destroy(&w->mu);
     pthread_mutex_destroy(&w->run_mu);
     pthread_mutex_destroy(&w->chat_mu);
+    pthread_mutex_destroy(&w->up_mu);
     free(w);
 }
