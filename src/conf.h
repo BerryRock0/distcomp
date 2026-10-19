@@ -79,6 +79,7 @@ typedef struct {
     long  timeout_ms;
     long  backoff_ms;
     char *outdir;
+    char *upload_dir;    /* каталог для файлов, загруженных из панели */
 
     /* [node] — глобальные параметры демона для всех узлов */
     dc_node_params node_params;
